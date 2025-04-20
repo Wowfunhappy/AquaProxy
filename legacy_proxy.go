@@ -1,4 +1,5 @@
-// +build ignore
+//go:build go1.16
+// +build go1.16
 
 package main
 
@@ -18,7 +19,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"os/signal"
+	"runtime/pprof"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,6 +43,31 @@ var (
 )
 
 func main() {
+	// Setup CPU profiling if requested
+	if len(os.Args) > 1 && os.Args[1] == "cpuprofile" {
+		f, err := os.Create("legacy_proxy_cpu.prof")
+		if err != nil {
+			log.Fatal("Could not create CPU profile: ", err)
+		}
+		
+		if err := pprof.StartCPUProfile(f); err != nil {
+			f.Close()
+			log.Fatal("Could not start CPU profile: ", err)
+		}
+		
+		// Ensure profile is written on exit
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigs
+			pprof.StopCPUProfile()
+			f.Close()
+			os.Exit(0)
+		}()
+		
+		log.Println("CPU profiling enabled - press Ctrl+C to stop and save profile")
+	}
+
 	ca, err := loadCA()
 	if err != nil {
 		log.Fatal("Error loading certificate:", err)
