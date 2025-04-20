@@ -40,7 +40,50 @@ var (
 	// In-memory cache for generated leaf certificates
 	leafCertCache = make(map[string]*tls.Certificate)
 	leafCertMutex sync.RWMutex
+	
+	// Pre-generated RSA keys for fast certificate generation
+	// This eliminates the expensive RSA key generation step
+	keyPool = make(chan *rsa.PrivateKey, 20)
 )
+
+// startKeyPool starts background generation of RSA keys 
+func startKeyPool() {
+	// Start key generation in background
+	go func() {
+		log.Println("Starting background key generation")
+		for {
+			// First check if the pool needs more keys
+			if len(keyPool) >= cap(keyPool) {
+				// Pool is full, wait before checking again
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			
+			// Generate a new RSA key only when needed
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			if err != nil {
+				log.Printf("Error pre-generating RSA key: %v", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			
+			// Add the key to the pool
+			keyPool <- key
+		}
+	}()
+}
+
+// getKey gets an RSA key from the pool or generates one if needed
+func getKey() (*rsa.PrivateKey, error) {
+	// Try to get a key from the pool with a short timeout
+	select {
+	case key := <-keyPool:
+		return key, nil
+	default:
+		// Immediately generate a key if none available
+		return rsa.GenerateKey(rand.Reader, 2048)
+	}
+}
 
 func main() {
 	// Setup CPU profiling if requested
@@ -67,6 +110,9 @@ func main() {
 		
 		log.Println("CPU profiling enabled - press Ctrl+C to stop and save profile")
 	}
+	
+	// Start background key generation
+	startKeyPool()
 
 	ca, err := loadCA()
 	if err != nil {
@@ -559,8 +605,8 @@ func genCert(ca *tls.Certificate, names []string) (*tls.Certificate, error) {
 		SignatureAlgorithm:    x509.SHA256WithRSA, // More compatible than ECDSA with SHA512
 	}
 	
-	// Use RSA keys for better compatibility with older systems
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	// Get a pre-generated key from the pool instead of generating a new one
+	key, err := getKey()
 	if err != nil {
 		return nil, err
 	}
