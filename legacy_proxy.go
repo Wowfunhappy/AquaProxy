@@ -1,6 +1,3 @@
-//go:build go1.16
-// +build go1.16
-
 package main
 
 import (
@@ -30,6 +27,7 @@ var (
 	hostname, _ = os.Hostname()
 
 	// Use certificates in current directory
+	
 	keyFile  = "legacy-mac-proxy-key.pem"
 	certFile = "legacy-mac-proxy-cert.pem"
 	
@@ -54,6 +52,12 @@ func startKeyPool() {
 	// Start key generation in background
 	go func() {
 		log.Println("Starting background key generation")
+		
+		// Set lower CPU priority for this goroutine
+		if err := syscall.Setpriority(syscall.PRIO_PROCESS, 0, 19); err != nil {
+			log.Printf("Warning: could not set lower CPU priority: %v", err)
+		}
+		
 		for {
 			// First check if the pool needs more keys
 			if len(keyPool) >= cap(keyPool) {
