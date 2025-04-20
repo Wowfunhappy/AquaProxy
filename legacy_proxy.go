@@ -32,6 +32,10 @@ var (
 	// In-memory cache for certificates fetched via AIA
 	aiaCertCache = make(map[string]*x509.Certificate)
 	aiaCacheMutex sync.RWMutex
+	
+	// In-memory cache for generated leaf certificates
+	leafCertCache = make(map[string]*tls.Certificate)
+	leafCertMutex sync.RWMutex
 )
 
 func main() {
@@ -360,7 +364,37 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
-	return genCert(p.CA, names)
+	// Create a cache key from the domain names
+	cacheKey := names[0]
+	
+	// Check if we have a cached certificate for this domain
+	leafCertMutex.RLock()
+	cachedCert, found := leafCertCache[cacheKey]
+	leafCertMutex.RUnlock()
+	
+	if found {
+		// Check if the certificate is still valid (has not expired)
+		if time.Now().Before(cachedCert.Leaf.NotAfter) {
+			return cachedCert, nil
+		}
+		// Certificate expired, remove from cache
+		leafCertMutex.Lock()
+		delete(leafCertCache, cacheKey)
+		leafCertMutex.Unlock()
+	}
+	
+	// Generate a new certificate
+	cert, err := genCert(p.CA, names)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Cache the new certificate
+	leafCertMutex.Lock()
+	leafCertCache[cacheKey] = cert
+	leafCertMutex.Unlock()
+	
+	return cert, nil
 }
 
 var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
