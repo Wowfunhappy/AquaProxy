@@ -10,8 +10,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -329,10 +329,49 @@ func loadCA() (cert tls.Certificate, err error) {
 // transparentProxy passes the request through without modifying content
 func transparentProxy(upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
+		log.Printf("[%s] Proxying request %s %s", reqID, r.Method, r.URL.String())
+		
 		// Clear encoding to avoid compression issues with older clients
 		r.Header.Set("Accept-Encoding", "")
-		upstream.ServeHTTP(w, r)
+		
+		// Capture response
+		rw := &responseTracker{
+			ResponseWriter: w,
+			reqID:          reqID,
+			url:            r.URL.String(),
+		}
+		
+		upstream.ServeHTTP(rw, r)
+		log.Printf("[%s] Request completed with status %d", reqID, rw.status)
 	})
+}
+
+// responseTracker tracks response status and completion
+type responseTracker struct {
+	http.ResponseWriter
+	reqID    string
+	url      string
+	status   int
+	wroteHeader bool
+}
+
+func (rw *responseTracker) WriteHeader(statusCode int) {
+	rw.wroteHeader = true
+	rw.status = statusCode
+	log.Printf("[%s] Writing header status %d for %s", rw.reqID, statusCode, rw.url)
+	rw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (rw *responseTracker) Write(b []byte) (int, error) {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	n, err := rw.ResponseWriter.Write(b)
+	if err != nil {
+		log.Printf("[%s] Error writing response: %v", rw.reqID, err)
+	}
+	return n, err
 }
 
 // Proxy is a forward proxy that substitutes its own certificate
@@ -376,71 +415,98 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	var (
-		err   error
-		sconn *tls.Conn
 		name  = dnsName(r.Host)
+		host  = r.Host
 	)
 
+	// Generate a unique ID for this connection
+	connID := fmt.Sprintf("conn-%p", r)
+	log.Printf("[%s] CONNECT request received for: %s", connID, host)
+
 	if name == "" {
-		log.Println("cannot determine cert name for " + r.Host)
+		log.Printf("[%s] Cannot determine cert name for %s", connID, host)
 		http.Error(w, "no upstream", 503)
 		return
 	}
 
-	provisionalCert, err := p.cert(name)
+	// Get certificate from cache or generate new one
+	cert, err := p.cert(name)
 	if err != nil {
-		log.Println("cert", err)
+		log.Printf("[%s] Certificate error for %s: %v", connID, name, err)
 		http.Error(w, "no upstream", 503)
 		return
 	}
 
+	// Create TLS server config
 	sConfig := new(tls.Config)
 	if p.TLSServerConfig != nil {
 		*sConfig = *p.TLSServerConfig
 	}
-	sConfig.Certificates = []tls.Certificate{*provisionalCert}
+	sConfig.Certificates = []tls.Certificate{*cert}
 	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		cConfig := new(tls.Config)
-		if p.TLSClientConfig != nil {
-			*cConfig = *p.TLSClientConfig
+		log.Printf("[%s] TLS ClientHello received - ServerName: %s", connID, hello.ServerName)
+		
+		// Only request a new cert if the ServerName differs from our initial one
+		if hello.ServerName == name {
+			return cert, nil
 		}
-		cConfig.ServerName = hello.ServerName
-		sconn, err = tls.Dial("tcp", r.Host, cConfig)
-		if err != nil {
-			log.Println("dial", r.Host, err)
-			return nil, err
-		}
+		
 		return p.cert(hello.ServerName)
 	}
 
-	cconn, err := handshake(w, sConfig)
+	// Perform TLS handshake with client
+	log.Printf("[%s] Starting TLS handshake with client", connID)
+	clientConn, err := handshake(w, sConfig)
 	if err != nil {
-		log.Println("handshake", r.Host, err)
+		log.Printf("[%s] Handshake error: %v", connID, err)
 		return
 	}
-	defer cconn.Close()
-	if sconn == nil {
-		log.Println("could not determine cert name for " + r.Host)
+	
+	// Set up client TLS config
+	cConfig := new(tls.Config)
+	if p.TLSClientConfig != nil {
+		*cConfig = *p.TLSClientConfig
+	}
+	cConfig.ServerName = name
+	
+	// Connect to the real server
+	log.Printf("[%s] Dialing upstream host: %s with SNI: %s", connID, host, name)
+	serverConn, err := tls.Dial("tcp", host, cConfig)
+	if err != nil {
+		log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+		clientConn.Close()
 		return
 	}
-	defer sconn.Close()
-
-	od := &oneShotDialer{c: sconn}
-	rp := &httputil.ReverseProxy{
-		Director:      httpsDirector,
-		Transport:     &http.Transport{DialTLS: od.Dial},
-		FlushInterval: p.FlushInterval,
-	}
-
-	ch := make(chan int)
-	wc := &onCloseConn{cconn, func() { ch <- 0 }}
-	http.Serve(&oneShotListener{wc}, p.Wrap(rp))
-	<-ch
+	
+	log.Printf("[%s] Connected to upstream server, setting up tunneling", connID)
+	
+	// We need proper connection closure coordination
+	done := make(chan bool, 2)
+	
+	// Client to server (in background)
+	go func() {
+		copyData(serverConn, clientConn, connID, "Client→Server")
+		// Signal done and close server connection from this end
+		done <- true
+		serverConn.Close()
+	}()
+	
+	// Server to client (in foreground)
+	copyData(clientConn, serverConn, connID, "Server→Client")
+	// Signal done and close client connection
+	done <- true
+	clientConn.Close()
+	
+	// Wait for the other direction to complete
+	<-done
+	
+	log.Printf("[%s] Tunnel connection completed for: %s", connID, name)
 }
 
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 	// Create a cache key from the domain names
 	cacheKey := names[0]
+	log.Printf("Certificate requested for: %s", cacheKey)
 	
 	// Check if we have a cached certificate for this domain
 	leafCertMutex.RLock()
@@ -450,26 +516,39 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 	if found {
 		// Check if the certificate is still valid (has not expired)
 		if time.Now().Before(cachedCert.Leaf.NotAfter) {
-			return cachedCert, nil
+			log.Printf("Using cached certificate for: %s (expires: %s)", cacheKey, cachedCert.Leaf.NotAfter)
+			// Create a defensive copy of the certificate to prevent shared state issues
+			certCopy := new(tls.Certificate)
+			*certCopy = *cachedCert
+			return certCopy, nil
 		}
+		log.Printf("Cached certificate for %s has expired, regenerating", cacheKey)
 		// Certificate expired, remove from cache
 		leafCertMutex.Lock()
 		delete(leafCertCache, cacheKey)
 		leafCertMutex.Unlock()
+	} else {
+		log.Printf("No cached certificate found for: %s", cacheKey)
 	}
 	
 	// Generate a new certificate
 	cert, err := genCert(p.CA, names)
 	if err != nil {
+		log.Printf("Error generating certificate for %s: %v", cacheKey, err)
 		return nil, err
 	}
+	
+	log.Printf("Successfully generated new certificate for: %s (expires: %s)", cacheKey, cert.Leaf.NotAfter)
 	
 	// Cache the new certificate
 	leafCertMutex.Lock()
 	leafCertCache[cacheKey] = cert
 	leafCertMutex.Unlock()
 	
-	return cert, nil
+	// Return a copy to prevent shared state issues
+	certCopy := new(tls.Certificate)
+	*certCopy = *cert
+	return certCopy, nil
 }
 
 var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
@@ -478,15 +557,20 @@ var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
 // and manually performs the TLS handshake. It returns the net.Conn or and
 // error if any.
 func handshake(w http.ResponseWriter, config *tls.Config) (net.Conn, error) {
+	// Hijack the HTTP connection
 	raw, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		http.Error(w, "no upstream", 503)
 		return nil, err
 	}
+	
+	// Send 200 OK to acknowledge the CONNECT
 	if _, err = raw.Write(okHeader); err != nil {
 		raw.Close()
 		return nil, err
 	}
+	
+	// Upgrade the connection to TLS
 	conn := tls.Server(raw, config)
 	err = conn.Handshake()
 	if err != nil {
@@ -494,17 +578,13 @@ func handshake(w http.ResponseWriter, config *tls.Config) (net.Conn, error) {
 		raw.Close()
 		return nil, err
 	}
+	
 	return conn, nil
 }
 
 func httpDirector(r *http.Request) {
 	r.URL.Host = r.Host
 	r.URL.Scheme = "http"
-}
-
-func httpsDirector(r *http.Request) {
-	r.URL.Host = r.Host
-	r.URL.Scheme = "https"
 }
 
 // dnsName returns the DNS name in addr, if any.
@@ -516,59 +596,36 @@ func dnsName(addr string) string {
 	return host
 }
 
-// A oneShotDialer implements net.Dialer whos Dial only returns a
-// net.Conn as specified by c followed by an error for each subsequent Dial.
-type oneShotDialer struct {
-	c  net.Conn
-	mu sync.Mutex
-}
-
-func (d *oneShotDialer) Dial(network, addr string) (net.Conn, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.c == nil {
-		return nil, errors.New("closed")
+// copyData copies data between connections without closing them
+func copyData(dst, src net.Conn, connID, direction string) {
+	// Use a reasonably sized buffer for performance
+	buf := make([]byte, 32*1024) // 32KB buffer
+	
+	var totalBytes int64
+	
+	for {
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			nw, werr := dst.Write(buf[0:nr])
+			if nw < nr {
+				log.Printf("[%s] %s short write", connID, direction)
+				break
+			}
+			totalBytes += int64(nw)
+			if werr != nil {
+				log.Printf("[%s] %s write error: %v", connID, direction, werr)
+				break
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[%s] %s read error: %v", connID, direction, err)
+			}
+			break
+		}
 	}
-	c := d.c
-	d.c = nil
-	return c, nil
-}
-
-// A oneShotListener implements net.Listener whos Accept only returns a
-// net.Conn as specified by c followed by an error for each subsequent Accept.
-type oneShotListener struct {
-	c net.Conn
-}
-
-func (l *oneShotListener) Accept() (net.Conn, error) {
-	if l.c == nil {
-		return nil, errors.New("closed")
-	}
-	c := l.c
-	l.c = nil
-	return c, nil
-}
-
-func (l *oneShotListener) Close() error {
-	return nil
-}
-
-func (l *oneShotListener) Addr() net.Addr {
-	return l.c.LocalAddr()
-}
-
-// A onCloseConn implements net.Conn and calls its f on Close.
-type onCloseConn struct {
-	net.Conn
-	f func()
-}
-
-func (c *onCloseConn) Close() error {
-	if c.f != nil {
-		c.f()
-		c.f = nil
-	}
-	return c.Conn.Close()
+	
+	log.Printf("[%s] %s copy complete, transferred %d bytes", connID, direction, totalBytes)
 }
 
 const (
