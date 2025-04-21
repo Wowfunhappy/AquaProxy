@@ -605,31 +605,10 @@ func dnsName(addr string) string {
 
 // copyData copies data between connections without closing them
 func copyData(dst, src net.Conn, connID, direction string) {
-	// Use a reasonably sized buffer for performance
-	buf := make([]byte, 32*1024) // 32KB buffer
+	totalBytes, err := io.Copy(dst, src)
 	
-	var totalBytes int64
-	
-	for {
-		nr, err := src.Read(buf)
-		if nr > 0 {
-			nw, werr := dst.Write(buf[0:nr])
-			if nw < nr {
-				log.Printf("[%s] %s short write", connID, direction)
-				break
-			}
-			totalBytes += int64(nw)
-			if werr != nil {
-				log.Printf("[%s] %s write error: %v", connID, direction, werr)
-				break
-			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[%s] %s read error: %v", connID, direction, err)
-			}
-			break
-		}
+	if err != nil && err != io.EOF {
+		log.Printf("[%s] %s copy error: %v", connID, direction, err)
 	}
 	
 	log.Printf("[%s] %s copy complete, transferred %d bytes", connID, direction, totalBytes)
