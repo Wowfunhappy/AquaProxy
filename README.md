@@ -2,7 +2,11 @@ In the near future, the Legacy Mac Proxy package will use this Go-based proxy in
 
 Based on code from https://codeload.github.com/kr/mitm.
 
-Build with Go 1.19. Then, use MacPorts Legacy Support and https://trac.macports.org/ticket/66749#comment:2 to make the binary run on Legacy OS X.
+To build:
+1. Install Go 1.19 on High Sierra.
+2. In `/usr/local/go/src/crypto/x509`, change `macOS.CFArrayAppendValue(policies, sslPolicy)` to `defer macOS.CFRelease(sslPolicy)`.
+3. Build normally with `go build`
+4. Inject the MacPorts Legacy Support library and https://trac.macports.org/ticket/66749#comment:2 to make the binary run on Legacy OS X.
 
 Todo:
 - Test on 10.6–10.8.
