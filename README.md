@@ -12,8 +12,9 @@ To build:
 -	macOS.CFArrayAppendValue(policies, sslPolicy)
 +	defer macOS.CFRelease(sslPolicy)
 +	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, sslPolicy)
+-	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, policies)
 ```
-3. Build normally with `go build`
+3. Build normally with `go build legacy_proxy.go`
 4. Inject the MacPorts Legacy Support library and https://trac.macports.org/ticket/66749#comment:2 to make the binary run on Legacy OS X.
 
 Todo:
