@@ -4,7 +4,7 @@ Based on code from https://codeload.github.com/kr/mitm.
 
 To build:
 1. Install Go 1.19 on High Sierra.
-2. In `/usr/local/go/src/crypto/x509`, change:
+2. In `/usr/local/go/src/crypto/x509/root_darwin.go`, change:
 ```
 -	policies := macOS.CFArrayCreateMutable()
 -	defer macOS.ReleaseCFArray(policies)
