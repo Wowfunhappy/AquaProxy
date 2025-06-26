@@ -21,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"bytes"
 )
 
 var (
@@ -46,6 +47,212 @@ var (
 	// This eliminates the expensive RSA key generation step
 	keyPool = make(chan *rsa.PrivateKey, 20)
 )
+
+// ClientHello detection structures
+type clientHelloInfo struct {
+	raw            []byte
+	tlsVersion     uint16
+	alpnProtocols  []string
+	supportsTLS13  bool
+	supportsHTTP2  bool
+	isModernClient bool
+}
+
+// TLS constants for parsing
+const (
+	tlsHandshakeTypeClientHello = 0x01
+	tlsExtensionALPN           = 0x0010
+	tlsExtensionSupportedVersions = 0x002b
+	
+	// TLS versions
+	tlsVersion10 = 0x0301
+	tlsVersion11 = 0x0302
+	tlsVersion12 = 0x0303
+	tlsVersion13 = 0x0304
+)
+
+// parseClientHello parses a TLS ClientHello message to detect modern TLS features
+func parseClientHello(data []byte) (*clientHelloInfo, error) {
+	info := &clientHelloInfo{
+		raw: data,
+	}
+	
+	// Minimum size check: 5 bytes for TLS record header + 4 bytes for handshake header
+	if len(data) < 9 {
+		return nil, fmt.Errorf("data too short to be ClientHello")
+	}
+	
+	// Check TLS record header
+	if data[0] != 0x16 { // Handshake record type
+		return nil, fmt.Errorf("not a TLS handshake record")
+	}
+	
+	// Skip TLS version from record header (backwards compatibility version)
+	_ = uint16(data[1])<<8 | uint16(data[2])
+	
+	// Get record length
+	recordLen := int(data[3])<<8 | int(data[4])
+	if len(data) < 5+recordLen {
+		return nil, fmt.Errorf("incomplete TLS record")
+	}
+	
+	// Parse handshake message
+	pos := 5
+	if data[pos] != tlsHandshakeTypeClientHello {
+		return nil, fmt.Errorf("not a ClientHello message")
+	}
+	
+	// Skip handshake length (3 bytes)
+	pos += 4
+	
+	// Get client version (2 bytes)
+	if len(data) < pos+2 {
+		return nil, fmt.Errorf("truncated ClientHello")
+	}
+	info.tlsVersion = uint16(data[pos])<<8 | uint16(data[pos+1])
+	pos += 2
+	
+	// Skip client random (32 bytes)
+	pos += 32
+	
+	// Skip session ID
+	if len(data) < pos+1 {
+		return nil, fmt.Errorf("truncated ClientHello at session ID")
+	}
+	sessionIDLen := int(data[pos])
+	pos += 1 + sessionIDLen
+	
+	// Skip cipher suites
+	if len(data) < pos+2 {
+		return nil, fmt.Errorf("truncated ClientHello at cipher suites")
+	}
+	cipherSuitesLen := int(data[pos])<<8 | int(data[pos+1])
+	pos += 2 + cipherSuitesLen
+	
+	// Skip compression methods
+	if len(data) < pos+1 {
+		return nil, fmt.Errorf("truncated ClientHello at compression")
+	}
+	compressionLen := int(data[pos])
+	pos += 1 + compressionLen
+	
+	// Parse extensions if present
+	if len(data) >= pos+2 {
+		extensionsLen := int(data[pos])<<8 | int(data[pos+1])
+		pos += 2
+		
+		if len(data) >= pos+extensionsLen {
+			if err := parseExtensions(data[pos:pos+extensionsLen], info); err != nil {
+				log.Printf("Error parsing extensions: %v", err)
+			}
+		}
+	}
+	
+	// Determine if this is a modern client
+	info.isModernClient = info.supportsTLS13 || info.supportsHTTP2
+	
+	return info, nil
+}
+
+// parseExtensions parses TLS extensions looking for ALPN and supported versions
+func parseExtensions(data []byte, info *clientHelloInfo) error {
+	pos := 0
+	
+	for pos+4 <= len(data) {
+		extType := uint16(data[pos])<<8 | uint16(data[pos+1])
+		extLen := int(data[pos+2])<<8 | int(data[pos+3])
+		pos += 4
+		
+		if pos+extLen > len(data) {
+			return fmt.Errorf("truncated extension")
+		}
+		
+		extData := data[pos : pos+extLen]
+		
+		switch extType {
+		case tlsExtensionALPN:
+			parseALPN(extData, info)
+		case tlsExtensionSupportedVersions:
+			parseSupportedVersions(extData, info)
+		}
+		
+		pos += extLen
+	}
+	
+	return nil
+}
+
+// parseALPN parses the ALPN extension to detect HTTP/2 support
+func parseALPN(data []byte, info *clientHelloInfo) {
+	if len(data) < 2 {
+		return
+	}
+	
+	protocolListLen := int(data[0])<<8 | int(data[1])
+	pos := 2
+	
+	for pos < 2+protocolListLen && pos < len(data) {
+		protoLen := int(data[pos])
+		pos++
+		
+		if pos+protoLen <= len(data) {
+			proto := string(data[pos : pos+protoLen])
+			info.alpnProtocols = append(info.alpnProtocols, proto)
+			
+			if proto == "h2" {
+				info.supportsHTTP2 = true
+			}
+		}
+		
+		pos += protoLen
+	}
+}
+
+// parseSupportedVersions parses the supported_versions extension to detect TLS 1.3
+func parseSupportedVersions(data []byte, info *clientHelloInfo) {
+	if len(data) < 1 {
+		return
+	}
+	
+	// For ClientHello, this is a list
+	listLen := int(data[0])
+	pos := 1
+	
+	for i := 0; i < listLen/2 && pos+2 <= len(data); i++ {
+		version := uint16(data[pos])<<8 | uint16(data[pos+1])
+		if version == tlsVersion13 {
+			info.supportsTLS13 = true
+		}
+		pos += 2
+	}
+}
+
+// peekClientHello peeks at the beginning of a connection to read the ClientHello
+func peekClientHello(conn net.Conn) (*clientHelloInfo, error) {
+	// We need to peek at enough data to parse the ClientHello
+	// Maximum size is 16KB for the TLS record
+	buf := make([]byte, 16384)
+	
+	// Set a short read timeout
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read ClientHello: %w", err)
+	}
+	
+	// Parse the ClientHello
+	info, err := parseClientHello(buf[:n])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse ClientHello: %w", err)
+	}
+	
+	// Store the exact bytes we read
+	info.raw = buf[:n]
+	
+	return info, nil
+}
 
 // startKeyPool starts background generation of RSA keys 
 func startKeyPool() {
@@ -433,78 +640,45 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get certificate from cache or generate new one
-	cert, err := p.cert(name)
-	if err != nil {
-		log.Printf("[%s] Certificate error for %s: %v", connID, name, err)
-		http.Error(w, "no upstream", 503)
-		return
-	}
-
-	// Create TLS server config
-	sConfig := new(tls.Config)
-	if p.TLSServerConfig != nil {
-		*sConfig = *p.TLSServerConfig
-	}
-	sConfig.Certificates = []tls.Certificate{*cert}
-	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		log.Printf("[%s] TLS ClientHello received - ServerName: %s", connID, hello.ServerName)
-		
-		// Only request a new cert if the ServerName differs from our initial one
-		if hello.ServerName == name {
-			return cert, nil
-		}
-		
-		return p.cert(hello.ServerName)
-	}
-
-	// Perform TLS handshake with client
-	log.Printf("[%s] Starting TLS handshake with client", connID)
-	clientConn, err := handshake(w, sConfig)
-	if err != nil {
-		log.Printf("[%s] Handshake error: %v", connID, err)
+	// Hijack the connection early
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		log.Printf("[%s] ResponseWriter does not support hijacking", connID)
+		http.Error(w, "internal server error", 500)
 		return
 	}
 	
-	// Set up client TLS config
-	cConfig := new(tls.Config)
-	if p.TLSClientConfig != nil {
-		*cConfig = *p.TLSClientConfig
-	}
-	cConfig.ServerName = name
-	
-	// Connect to the real server
-	log.Printf("[%s] Dialing upstream host: %s with SNI: %s", connID, host, name)
-	serverConn, err := tls.Dial("tcp", host, cConfig)
+	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+		log.Printf("[%s] Failed to hijack connection: %v", connID, err)
+		http.Error(w, "internal server error", 500)
+		return
+	}
+	
+	// Send 200 OK response
+	if _, err = clientConn.Write(okHeader); err != nil {
+		log.Printf("[%s] Failed to send 200 OK: %v", connID, err)
 		clientConn.Close()
 		return
 	}
 	
-	log.Printf("[%s] Connected to upstream server, setting up tunneling", connID)
+	// Peek at the ClientHello to determine routing
+	clientHello, err := peekClientHello(clientConn)
+	if err != nil {
+		log.Printf("[%s] Failed to peek ClientHello: %v - falling back to MITM mode", connID, err)
+		// Fall back to MITM mode if we can't parse the ClientHello
+		p.serveMITM(clientConn, host, name, nil, connID)
+		return
+	}
 	
-	// We need proper connection closure coordination
-	done := make(chan bool, 2)
-	
-	// Client to server (in background)
-	go func() {
-		copyData(serverConn, clientConn, connID, "Client→Server")
-		// Signal done and close server connection from this end
-		done <- true
-		serverConn.Close()
-	}()
-	
-	// Server to client (in foreground)
-	copyData(clientConn, serverConn, connID, "Server→Client")
-	// Signal done and close client connection
-	done <- true
-	clientConn.Close()
-	
-	// Wait for the other direction to complete
-	<-done
-	
-	log.Printf("[%s] Tunnel connection completed for: %s", connID, name)
+	// Route based on client capabilities
+	if clientHello.isModernClient {
+		// Modern client detected - use passthrough mode
+		p.passthroughConnection(clientConn, host, clientHello, connID)
+	} else {
+		// Legacy client - use MITM mode
+		p.serveMITM(clientConn, host, name, clientHello, connID)
+	}
 }
 
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
@@ -557,35 +731,6 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 
 var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
 
-// handshake hijacks w's underlying net.Conn, responds to the CONNECT request
-// and manually performs the TLS handshake. It returns the net.Conn or and
-// error if any.
-func handshake(w http.ResponseWriter, config *tls.Config) (net.Conn, error) {
-	// Hijack the HTTP connection
-	raw, _, err := w.(http.Hijacker).Hijack()
-	if err != nil {
-		http.Error(w, "no upstream", 503)
-		return nil, err
-	}
-	
-	// Send 200 OK to acknowledge the CONNECT
-	if _, err = raw.Write(okHeader); err != nil {
-		raw.Close()
-		return nil, err
-	}
-	
-	// Upgrade the connection to TLS
-	conn := tls.Server(raw, config)
-	err = conn.Handshake()
-	if err != nil {
-		conn.Close()
-		raw.Close()
-		return nil, err
-	}
-	
-	return conn, nil
-}
-
 func httpDirector(r *http.Request) {
 	r.URL.Host = r.Host
 	r.URL.Scheme = "http"
@@ -609,6 +754,166 @@ func copyData(dst, src net.Conn, connID, direction string) {
 	}
 	
 	log.Printf("[%s] %s copy complete, transferred %d bytes", connID, direction, totalBytes)
+}
+
+// passthroughConnection handles a connection in passthrough mode without TLS interception
+func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHello *clientHelloInfo, connID string) {
+	log.Printf("[%s] PASSTHROUGH mode for %s (TLS 1.3: %v, HTTP/2: %v, ALPN: %v)", 
+		connID, host, clientHello.supportsTLS13, clientHello.supportsHTTP2, clientHello.alpnProtocols)
+	
+	// Connect to the real server
+	serverConn, err := net.Dial("tcp", host)
+	if err != nil {
+		log.Printf("[%s] Failed to connect to upstream host %s: %v", connID, host, err)
+		clientConn.Close()
+		return
+	}
+	
+	// Send the ClientHello we already read to the server
+	_, err = serverConn.Write(clientHello.raw)
+	if err != nil {
+		log.Printf("[%s] Failed to send ClientHello to server: %v", connID, err)
+		serverConn.Close()
+		clientConn.Close()
+		return
+	}
+	
+	log.Printf("[%s] Sent ClientHello to upstream server, starting passthrough relay", connID)
+	
+	// Set up bidirectional copying
+	done := make(chan bool, 2)
+	
+	// Client to server
+	go func() {
+		copyData(serverConn, clientConn, connID, "Client→Server")
+		done <- true
+		serverConn.Close()
+	}()
+	
+	// Server to client
+	go func() {
+		copyData(clientConn, serverConn, connID, "Server→Client")
+		done <- true
+		clientConn.Close()
+	}()
+	
+	// Wait for both directions to complete
+	<-done
+	<-done
+	
+	log.Printf("[%s] Passthrough connection completed for: %s", connID, host)
+}
+
+// serveMITM handles a connection in MITM mode with TLS interception
+func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *clientHelloInfo, connID string) {
+	if clientHello != nil {
+		log.Printf("[%s] MITM mode for %s (TLS version: 0x%04x, ALPN: %v)", 
+			connID, host, clientHello.tlsVersion, clientHello.alpnProtocols)
+	} else {
+		log.Printf("[%s] MITM mode for %s (no ClientHello info available)", connID, host)
+	}
+	
+	// Get certificate from cache or generate new one
+	cert, err := p.cert(name)
+	if err != nil {
+		log.Printf("[%s] Certificate error for %s: %v", connID, name, err)
+		clientConn.Close()
+		return
+	}
+	
+	// Create TLS server config
+	sConfig := new(tls.Config)
+	if p.TLSServerConfig != nil {
+		*sConfig = *p.TLSServerConfig
+	}
+	sConfig.Certificates = []tls.Certificate{*cert}
+	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		log.Printf("[%s] TLS ClientHello received - ServerName: %s", connID, hello.ServerName)
+		
+		// Only request a new cert if the ServerName differs from our initial one
+		if hello.ServerName == name {
+			return cert, nil
+		}
+		
+		return p.cert(hello.ServerName)
+	}
+	
+	// Create a connection that can replay the ClientHello
+	var tlsConn *tls.Conn
+	if clientHello != nil {
+		// We have already read the ClientHello, so we need to create a special connection
+		// that will replay it when the TLS handshake starts
+		replayConn := &replayConn{
+			Conn:   clientConn,
+			buffer: bytes.NewBuffer(clientHello.raw),
+		}
+		tlsConn = tls.Server(replayConn, sConfig)
+	} else {
+		// No ClientHello was peeked, proceed normally
+		tlsConn = tls.Server(clientConn, sConfig)
+	}
+	
+	// Perform TLS handshake
+	log.Printf("[%s] Starting TLS handshake with client", connID)
+	err = tlsConn.Handshake()
+	if err != nil {
+		log.Printf("[%s] TLS handshake error: %v", connID, err)
+		tlsConn.Close()
+		return
+	}
+	
+	// Set up client TLS config for upstream connection
+	cConfig := new(tls.Config)
+	if p.TLSClientConfig != nil {
+		*cConfig = *p.TLSClientConfig
+	}
+	cConfig.ServerName = name
+	
+	// Connect to the real server
+	log.Printf("[%s] Dialing upstream host: %s with SNI: %s", connID, host, name)
+	serverConn, err := tls.Dial("tcp", host, cConfig)
+	if err != nil {
+		log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+		tlsConn.Close()
+		return
+	}
+	
+	log.Printf("[%s] Connected to upstream server, setting up MITM tunneling", connID)
+	
+	// Set up bidirectional copying
+	done := make(chan bool, 2)
+	
+	// Client to server
+	go func() {
+		copyData(serverConn, tlsConn, connID, "Client→Server")
+		done <- true
+		serverConn.Close()
+	}()
+	
+	// Server to client
+	copyData(tlsConn, serverConn, connID, "Server→Client")
+	done <- true
+	tlsConn.Close()
+	
+	// Wait for the other direction to complete
+	<-done
+	
+	log.Printf("[%s] MITM tunnel connection completed for: %s", connID, name)
+}
+
+// replayConn is a net.Conn wrapper that replays buffered data before reading from the underlying connection
+type replayConn struct {
+	net.Conn
+	buffer *bytes.Buffer
+}
+
+func (c *replayConn) Read(b []byte) (int, error) {
+	// First, read from the buffer if there's data
+	if c.buffer.Len() > 0 {
+		return c.buffer.Read(b)
+	}
+	// Then read from the underlying connection
+	return c.Conn.Read(b)
 }
 
 const (
