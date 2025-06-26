@@ -786,20 +786,30 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	// Client to server
 	go func() {
 		copyData(serverConn, clientConn, connID, "Client→Server")
+		// Half-close: signal EOF to server but keep reading
+		if tcpConn, ok := serverConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 		done <- true
-		serverConn.Close()
 	}()
 	
 	// Server to client
 	go func() {
 		copyData(clientConn, serverConn, connID, "Server→Client")
+		// Half-close: signal EOF to client but keep reading
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 		done <- true
-		clientConn.Close()
 	}()
 	
 	// Wait for both directions to complete
 	<-done
 	<-done
+	
+	// Now close both connections fully
+	clientConn.Close()
+	serverConn.Close()
 	
 	log.Printf("[%s] Passthrough connection completed for: %s", connID, host)
 }
@@ -886,17 +896,24 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	// Client to server
 	go func() {
 		copyData(serverConn, tlsConn, connID, "Client→Server")
+		// For TLS connections, we can't use half-close, but we avoid closing
+		// the connection until both directions are done
 		done <- true
-		serverConn.Close()
 	}()
 	
 	// Server to client
-	copyData(tlsConn, serverConn, connID, "Server→Client")
-	done <- true
-	tlsConn.Close()
+	go func() {
+		copyData(tlsConn, serverConn, connID, "Server→Client")
+		done <- true
+	}()
 	
-	// Wait for the other direction to complete
+	// Wait for both directions to complete
 	<-done
+	<-done
+	
+	// Now close both connections
+	tlsConn.Close()
+	serverConn.Close()
 	
 	log.Printf("[%s] MITM tunnel connection completed for: %s", connID, name)
 }
