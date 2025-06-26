@@ -339,9 +339,6 @@ func transparentProxy(upstream http.Handler) http.Handler {
 		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
 		log.Printf("[%s] Proxying request %s %s", reqID, r.Method, r.URL.String())
 		
-		// Clear encoding to avoid compression issues with older clients
-		r.Header.Set("Accept-Encoding", "")
-		
 		// Capture response
 		rw := &responseTracker{
 			ResponseWriter: w,
