@@ -19,9 +19,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -52,6 +54,11 @@ var (
 	
 	// Command line flags
 	logURLs = flag.Bool("log-urls", false, "Print URLs being accessed in MITM mode")
+	
+	// URL redirect configuration
+	redirectRules = make(map[string][]redirectRule)
+	redirectDomains = make(map[string]bool)
+	redirectMutex sync.RWMutex
 )
 
 // ClientHello detection structures
@@ -62,6 +69,13 @@ type clientHelloInfo struct {
 	supportsTLS13  bool
 	supportsHTTP2  bool
 	isModernClient bool
+}
+
+// redirectRule represents a URL redirect rule
+type redirectRule struct {
+	fromURL    *url.URL
+	toURL      *url.URL
+	isPrefix   bool // true if the fromURL ends with / and should match prefixes
 }
 
 // TLS constants for parsing
@@ -305,6 +319,126 @@ func getKey() (*rsa.PrivateKey, error) {
 	}
 }
 
+// checkRedirect checks if the request URL matches any redirect rules and returns the target URL
+func checkRedirect(reqURL *url.URL) (*url.URL, bool) {
+	redirectMutex.RLock()
+	defer redirectMutex.RUnlock()
+	
+	// Check if domain has any redirect rules
+	rules, exists := redirectRules[reqURL.Host]
+	if !exists {
+		return nil, false
+	}
+	
+	// Build the full URL string for comparison
+	fullURL := reqURL.String()
+	
+	// Check each rule for the domain
+	for _, rule := range rules {
+		if rule.isPrefix {
+			// This is a prefix match (fromURL ended with /)
+			fromPrefix := rule.fromURL.String()
+			if strings.HasPrefix(fullURL, fromPrefix) {
+				// Apply the redirect, preserving the path suffix
+				suffix := strings.TrimPrefix(fullURL, fromPrefix)
+				targetURL := rule.toURL.ResolveReference(&url.URL{Path: suffix})
+				return targetURL, true
+			}
+		} else {
+			// This is an exact match
+			if fullURL == rule.fromURL.String() {
+				return rule.toURL, true
+			}
+		}
+	}
+	
+	return nil, false
+}
+
+// loadRedirectRules loads URL redirect rules from redirects.txt
+func loadRedirectRules() error {
+	redirectFile := "redirects.txt"
+	
+	// Check if file exists
+	if _, err := os.Stat(redirectFile); os.IsNotExist(err) {
+		log.Println("No redirects.txt file found, URL redirects disabled")
+		return nil
+	}
+	
+	file, err := os.Open(redirectFile)
+	if err != nil {
+		return fmt.Errorf("failed to open redirects file: %w", err)
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	var fromURL *url.URL
+	
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+		
+		// Parse URL
+		u, err := url.Parse(line)
+		if err != nil {
+			log.Printf("Warning: Invalid URL on line %d: %s", lineNum, line)
+			continue
+		}
+		
+		// Ensure URL has a scheme
+		if u.Scheme == "" {
+			log.Printf("Warning: URL missing scheme on line %d: %s", lineNum, line)
+			continue
+		}
+		
+		if fromURL == nil {
+			// This is a "from" URL
+			fromURL = u
+		} else {
+			// This is a "to" URL, create the redirect rule
+			rule := redirectRule{
+				fromURL:  fromURL,
+				toURL:    u,
+				isPrefix: strings.HasSuffix(fromURL.Path, "/"),
+			}
+			
+			// Extract domain from fromURL
+			domain := fromURL.Host
+			
+			redirectMutex.Lock()
+			redirectRules[domain] = append(redirectRules[domain], rule)
+			redirectDomains[domain] = true
+			redirectMutex.Unlock()
+			
+			log.Printf("Loaded redirect: %s -> %s (prefix=%v)", fromURL.String(), u.String(), rule.isPrefix)
+			
+			// Reset for next pair
+			fromURL = nil
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading redirects file: %w", err)
+	}
+	
+	if fromURL != nil {
+		log.Printf("Warning: Incomplete redirect rule (missing target URL) for: %s", fromURL.String())
+	}
+	
+	redirectMutex.RLock()
+	domainCount := len(redirectDomains)
+	redirectMutex.RUnlock()
+	
+	log.Printf("Loaded %d domains with redirect rules", domainCount)
+	return nil
+}
+
 func main() {
 	// Parse command line flags
 	flag.Parse()
@@ -332,6 +466,12 @@ func main() {
 		}()
 		
 		log.Println("CPU profiling enabled - press Ctrl+C to stop and save profile")
+	}
+	
+	// Load redirect rules
+	if err := loadRedirectRules(); err != nil {
+		log.Printf("Error loading redirect rules: %v", err)
+		// Continue running without redirects
 	}
 	
 	// Start background key generation
@@ -555,6 +695,22 @@ func transparentProxy(upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
 		
+		// Build full URL for redirect checking
+		fullURL := r.URL
+		if fullURL.Scheme == "" {
+			fullURL.Scheme = "http"
+		}
+		if fullURL.Host == "" {
+			fullURL.Host = r.Host
+		}
+		
+		// Check for redirects
+		if targetURL, shouldRedirect := checkRedirect(fullURL); shouldRedirect {
+			log.Printf("[%s] HTTP Redirecting %s -> %s", reqID, fullURL.String(), targetURL.String())
+			http.Redirect(w, r, targetURL.String(), http.StatusFound)
+			return
+		}
+		
 		// Log URL if flag is enabled (for plain HTTP requests)
 		if *logURLs {
 			log.Printf("[%s] HTTP URL: %s %s", reqID, r.Method, r.URL.String())
@@ -682,14 +838,30 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Route based on client capabilities
-	if clientHello.isModernClient {
-		// Modern client detected - use passthrough mode
+	// Check if domain has redirect rules
+	// Extract domain without port
+	domain := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		domain = h
+	}
+	
+	redirectMutex.RLock()
+	hasRedirects := redirectDomains[domain]
+	redirectMutex.RUnlock()
+	
+	
+	// Route based on client capabilities and redirect rules
+	if clientHello.isModernClient && !hasRedirects {
+		// Modern client detected and no redirects - use passthrough mode
 		log.Printf("[%s] PASSTHROUGH: %s", connID, host)
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
-		// Legacy client - use MITM mode
-		log.Printf("[%s] MITM: %s", connID, host)
+		// Legacy client OR domain has redirects - use MITM mode
+		if hasRedirects {
+			log.Printf("[%s] MITM (redirects): %s", connID, host)
+		} else {
+			log.Printf("[%s] MITM (legacy): %s", connID, host)
+		}
 		p.serveMITM(clientConn, host, name, clientHello, connID)
 	}
 }
@@ -817,8 +989,8 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	
 }
 
-// handleMITMWithLogging handles MITM connections with HTTP parsing and URL logging
-func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, host, connID string) {
+// handleMITMWithLogging handles MITM connections with HTTP parsing and URL logging/redirects
+func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, host, connID string, checkRedirects bool) {
 	// Read HTTP requests from client and forward to server
 	reader := bufio.NewReader(tlsConn)
 	for {
@@ -831,16 +1003,59 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 			break
 		}
 		
-		// Log the URL
-		fullURL := fmt.Sprintf("https://%s%s", req.Host, req.URL.String())
+		// Set up the request URL
+		req.URL.Scheme = "https"
 		if req.Host == "" {
-			fullURL = fmt.Sprintf("https://%s%s", host, req.URL.String())
+			req.Host = host
 		}
-		log.Printf("[%s] MITM URL: %s %s", connID, req.Method, fullURL)
+		req.URL.Host = req.Host
+		
+		// Log the URL if enabled
+		if *logURLs {
+			fullURL := fmt.Sprintf("https://%s%s", req.Host, req.URL.Path)
+			if req.URL.RawQuery != "" {
+				fullURL += "?" + req.URL.RawQuery
+			}
+			log.Printf("[%s] MITM URL: %s %s", connID, req.Method, fullURL)
+		}
+		
+		// Check for redirects if enabled for this domain
+		if checkRedirects {
+			if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
+				log.Printf("[%s] Redirecting %s -> %s", connID, req.URL.String(), targetURL.String())
+				
+				// Update request to point to new URL
+				req.URL = targetURL
+				req.Host = targetURL.Host
+				
+				// If the target is on a different host, we need a new connection
+				if targetURL.Host != host {
+					// Send a 307 redirect response to preserve the HTTP method
+					resp := &http.Response{
+						Status:     "307 Temporary Redirect",
+						StatusCode: 307,
+						Proto:      req.Proto,
+						ProtoMajor: req.ProtoMajor,
+						ProtoMinor: req.ProtoMinor,
+						Header:     make(http.Header),
+						Request:    req,
+					}
+					resp.Header.Set("Location", targetURL.String())
+					resp.Header.Set("Content-Length", "0")
+					
+					err = resp.Write(tlsConn)
+					if err != nil {
+						log.Printf("[%s] Error writing redirect response: %v", connID, err)
+						break
+					}
+					
+					// Skip to next request
+					continue
+				}
+			}
+		}
 		
 		// Forward request to server
-		req.URL.Scheme = "https"
-		req.URL.Host = host
 		req.RequestURI = "" // Must be cleared for client requests
 		
 		// Create a client with the existing server connection
@@ -996,10 +1211,22 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		return
 	}
 	
-	// If URL logging is enabled, parse HTTP requests; otherwise use efficient raw copying
-	if *logURLs {
-		// Parse and log HTTP requests
-		p.handleMITMWithLogging(tlsConn, serverConn, host, connID)
+	// Check if domain has redirect rules
+	// Extract domain without port
+	domain := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		domain = h
+	}
+	
+	redirectMutex.RLock()
+	hasRedirects := redirectDomains[domain]
+	redirectMutex.RUnlock()
+	
+	
+	// If URL logging is enabled OR domain has redirects, parse HTTP requests
+	if *logURLs || hasRedirects {
+		// Parse and handle HTTP requests
+		p.handleMITMWithLogging(tlsConn, serverConn, host, connID, hasRedirects)
 	} else {
 		// Use efficient raw TCP/TLS forwarding (original behavior)
 		done := make(chan bool, 2)

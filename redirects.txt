@@ -1,0 +1,5 @@
+https://help.apple.com/Library/Documentation/Resources/Flamingo/6/flamingo.js
+https://web.archive.org/web/20230921163646id_/https://help.apple.com/Library/Documentation/Resources/Flamingo/6/flamingo.js
+
+https://api.twitter.com/
+https://twitterbridge.loganserver.net/
