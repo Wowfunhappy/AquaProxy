@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -8,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -22,7 +25,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"bytes"
 )
 
 var (
@@ -47,6 +49,9 @@ var (
 	// Pre-generated RSA keys for fast certificate generation
 	// This eliminates the expensive RSA key generation step
 	keyPool = make(chan *rsa.PrivateKey, 20)
+	
+	// Command line flags
+	logURLs = flag.Bool("log-urls", false, "Print URLs being accessed in MITM mode")
 )
 
 // ClientHello detection structures
@@ -301,8 +306,11 @@ func getKey() (*rsa.PrivateKey, error) {
 }
 
 func main() {
+	// Parse command line flags
+	flag.Parse()
+	
 	// Setup CPU profiling if requested
-	if len(os.Args) > 1 && os.Args[1] == "cpuprofile" {
+	if flag.NArg() > 0 && flag.Arg(0) == "cpu-profile" {
 		f, err := os.Create("legacy_proxy_cpu.prof")
 		if err != nil {
 			log.Fatal("Could not create CPU profile: ", err)
@@ -379,6 +387,9 @@ func main() {
 
 	log.Println("Starting proxy on port 6531")
 	log.Println("Using certificate from:", certFile)
+	if *logURLs {
+		log.Println("URL logging is ENABLED")
+	}
 	log.Fatal(http.ListenAndServe(":6531", p))
 }
 
@@ -543,6 +554,11 @@ func loadCA() (cert tls.Certificate, err error) {
 func transparentProxy(upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
+		
+		// Log URL if flag is enabled (for plain HTTP requests)
+		if *logURLs {
+			log.Printf("[%s] HTTP URL: %s %s", reqID, r.Method, r.URL.String())
+		}
 		
 		// Capture response
 		rw := &responseTracker{
@@ -801,6 +817,102 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	
 }
 
+// handleMITMWithLogging handles MITM connections with HTTP parsing and URL logging
+func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, host, connID string) {
+	// Read HTTP requests from client and forward to server
+	reader := bufio.NewReader(tlsConn)
+	for {
+		// Read the request
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[%s] Error reading request: %v", connID, err)
+			}
+			break
+		}
+		
+		// Log the URL
+		fullURL := fmt.Sprintf("https://%s%s", req.Host, req.URL.String())
+		if req.Host == "" {
+			fullURL = fmt.Sprintf("https://%s%s", host, req.URL.String())
+		}
+		log.Printf("[%s] MITM URL: %s %s", connID, req.Method, fullURL)
+		
+		// Forward request to server
+		req.URL.Scheme = "https"
+		req.URL.Host = host
+		req.RequestURI = "" // Must be cleared for client requests
+		
+		// Create a client with the existing server connection
+		client := &http.Client{
+			Transport: &http.Transport{
+				DialTLS: func(network, addr string) (net.Conn, error) {
+					return serverConn, nil
+				},
+			},
+		}
+		
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[%s] Error forwarding request: %v", connID, err)
+			// Send error response to client
+			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			break
+		}
+		
+		// Write response back to client
+		err = resp.Write(tlsConn)
+		if err != nil {
+			log.Printf("[%s] Error writing response: %v", connID, err)
+			resp.Body.Close()
+			break
+		}
+		resp.Body.Close()
+		
+		// Check if connection should be closed
+		if req.Close || resp.Close {
+			break
+		}
+	}
+	
+	// Close connections
+	tlsConn.Close()
+	serverConn.Close()
+}
+
+// singleUseListener implements net.Listener for a single connection
+type singleUseListener struct {
+	conn   net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *singleUseListener) Accept() (net.Conn, error) {
+	select {
+	case <-l.closed:
+		return nil, io.EOF
+	default:
+		l.once.Do(func() {
+			close(l.closed)
+		})
+		return l.conn, nil
+	}
+}
+
+func (l *singleUseListener) Close() error {
+	select {
+	case <-l.closed:
+		return nil
+	default:
+		close(l.closed)
+		return nil
+	}
+}
+
+func (l *singleUseListener) Addr() net.Addr {
+	return l.conn.LocalAddr()
+}
+
 // serveMITM handles a connection in MITM mode with TLS interception
 func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *clientHelloInfo, connID string) {
 	// Get certificate from cache or generate new one
@@ -884,30 +996,36 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		return
 	}
 	
-	// Set up bidirectional copying
-	done := make(chan bool, 2)
-	
-	// Client to server
-	go func() {
-		copyData(serverConn, tlsConn, connID, "Client→Server")
-		// For TLS connections, we can't use half-close, but we avoid closing
-		// the connection until both directions are done
-		done <- true
-	}()
-	
-	// Server to client
-	go func() {
-		copyData(tlsConn, serverConn, connID, "Server→Client")
-		done <- true
-	}()
-	
-	// Wait for both directions to complete
-	<-done
-	<-done
-	
-	// Now close both connections
-	tlsConn.Close()
-	serverConn.Close()
+	// If URL logging is enabled, parse HTTP requests; otherwise use efficient raw copying
+	if *logURLs {
+		// Parse and log HTTP requests
+		p.handleMITMWithLogging(tlsConn, serverConn, host, connID)
+	} else {
+		// Use efficient raw TCP/TLS forwarding (original behavior)
+		done := make(chan bool, 2)
+		
+		// Client to server
+		go func() {
+			copyData(serverConn, tlsConn, connID, "Client→Server")
+			// For TLS connections, we can't use half-close, but we avoid closing
+			// the connection until both directions are done
+			done <- true
+		}()
+		
+		// Server to client
+		go func() {
+			copyData(tlsConn, serverConn, connID, "Server→Client")
+			done <- true
+		}()
+		
+		// Wait for both directions to complete
+		<-done
+		<-done
+		
+		// Now close both connections
+		tlsConn.Close()
+		serverConn.Close()
+	}
 }
 
 // extractCertificateChainInfo analyzes the certificate chain to identify the missing root
