@@ -376,7 +376,7 @@ func main() {
 		Wrap:             transparentProxy,
 	}
 
-	log.Println("Starting MITM proxy on port 6531")
+	log.Println("Starting proxy on port 6531")
 	log.Println("Using certificate from:", certFile)
 	log.Fatal(http.ListenAndServe(":6531", p))
 }
@@ -460,13 +460,11 @@ func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool) ([]*x509.Certif
 		aiaCacheMutex.RUnlock()
 		
 		if found {
-			log.Println("Using cached AIA certificate for URL:", url)
 			intermediates.AddCert(cachedCert)
 			downloadedCerts = append(downloadedCerts, cachedCert)
 			continue
 		}
 		
-		log.Println("Fetching AIA certificate from:", url)
 		resp, err := http.Get(url)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			log.Println("Failed to fetch AIA certificate:", err)
@@ -544,7 +542,6 @@ func loadCA() (cert tls.Certificate, err error) {
 func transparentProxy(upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
-		log.Printf("[%s] Proxying request %s %s", reqID, r.Method, r.URL.String())
 		
 		// Capture response
 		rw := &responseTracker{
@@ -554,7 +551,6 @@ func transparentProxy(upstream http.Handler) http.Handler {
 		}
 		
 		upstream.ServeHTTP(rw, r)
-		log.Printf("[%s] Request completed with status %d", reqID, rw.status)
 	})
 }
 
@@ -570,7 +566,6 @@ type responseTracker struct {
 func (rw *responseTracker) WriteHeader(statusCode int) {
 	rw.wroteHeader = true
 	rw.status = statusCode
-	log.Printf("[%s] Writing header status %d for %s", rw.reqID, statusCode, rw.url)
 	rw.ResponseWriter.WriteHeader(statusCode)
 }
 
@@ -632,7 +627,6 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Generate a unique ID for this connection
 	connID := fmt.Sprintf("conn-%p", r)
-	log.Printf("[%s] CONNECT request received for: %s", connID, host)
 
 	if name == "" {
 		log.Printf("[%s] Cannot determine cert name for %s", connID, host)
@@ -674,9 +668,11 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	// Route based on client capabilities
 	if clientHello.isModernClient {
 		// Modern client detected - use passthrough mode
+		log.Printf("[%s] PASSTHROUGH: %s", connID, host)
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
 		// Legacy client - use MITM mode
+		log.Printf("[%s] MITM: %s", connID, host)
 		p.serveMITM(clientConn, host, name, clientHello, connID)
 	}
 }
@@ -705,8 +701,6 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 		leafCertMutex.Lock()
 		delete(leafCertCache, cacheKey)
 		leafCertMutex.Unlock()
-	} else {
-		log.Printf("No cached certificate found for: %s", cacheKey)
 	}
 	
 	// Generate a new certificate
@@ -747,20 +741,15 @@ func dnsName(addr string) string {
 
 // copyData copies data between connections without closing them
 func copyData(dst, src net.Conn, connID, direction string) {
-	totalBytes, err := io.Copy(dst, src)
+	_, err := io.Copy(dst, src)
 	
 	if err != nil && err != io.EOF {
 		log.Printf("[%s] %s copy error: %v", connID, direction, err)
 	}
-	
-	log.Printf("[%s] %s copy complete, transferred %d bytes", connID, direction, totalBytes)
 }
 
 // passthroughConnection handles a connection in passthrough mode without TLS interception
 func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHello *clientHelloInfo, connID string) {
-	log.Printf("[%s] PASSTHROUGH mode for %s (TLS 1.3: %v, HTTP/2: %v, ALPN: %v)", 
-		connID, host, clientHello.supportsTLS13, clientHello.supportsHTTP2, clientHello.alpnProtocols)
-	
 	// Connect to the real server
 	serverConn, err := net.Dial("tcp", host)
 	if err != nil {
@@ -777,8 +766,6 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 		clientConn.Close()
 		return
 	}
-	
-	log.Printf("[%s] Sent ClientHello to upstream server, starting passthrough relay", connID)
 	
 	// Set up bidirectional copying
 	done := make(chan bool, 2)
@@ -811,18 +798,10 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	clientConn.Close()
 	serverConn.Close()
 	
-	log.Printf("[%s] Passthrough connection completed for: %s", connID, host)
 }
 
 // serveMITM handles a connection in MITM mode with TLS interception
 func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *clientHelloInfo, connID string) {
-	if clientHello != nil {
-		log.Printf("[%s] MITM mode for %s (TLS version: 0x%04x, ALPN: %v)", 
-			connID, host, clientHello.tlsVersion, clientHello.alpnProtocols)
-	} else {
-		log.Printf("[%s] MITM mode for %s (no ClientHello info available)", connID, host)
-	}
-	
 	// Get certificate from cache or generate new one
 	cert, err := p.cert(name)
 	if err != nil {
@@ -838,8 +817,6 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	}
 	sConfig.Certificates = []tls.Certificate{*cert}
 	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		log.Printf("[%s] TLS ClientHello received - ServerName: %s", connID, hello.ServerName)
-		
 		// Only request a new cert if the ServerName differs from our initial one
 		if hello.ServerName == name {
 			return cert, nil
@@ -864,7 +841,6 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	}
 	
 	// Perform TLS handshake
-	log.Printf("[%s] Starting TLS handshake with client", connID)
 	err = tlsConn.Handshake()
 	if err != nil {
 		log.Printf("[%s] TLS handshake error: %v", connID, err)
@@ -880,15 +856,12 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	cConfig.ServerName = name
 	
 	// Connect to the real server
-	log.Printf("[%s] Dialing upstream host: %s with SNI: %s", connID, host, name)
 	serverConn, err := tls.Dial("tcp", host, cConfig)
 	if err != nil {
 		log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
 		tlsConn.Close()
 		return
 	}
-	
-	log.Printf("[%s] Connected to upstream server, setting up MITM tunneling", connID)
 	
 	// Set up bidirectional copying
 	done := make(chan bool, 2)
@@ -915,7 +888,6 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	tlsConn.Close()
 	serverConn.Close()
 	
-	log.Printf("[%s] MITM tunnel connection completed for: %s", connID, name)
 }
 
 // replayConn is a net.Conn wrapper that replays buffered data before reading from the underlying connection
