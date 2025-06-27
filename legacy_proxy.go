@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -858,7 +859,27 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	// Connect to the real server
 	serverConn, err := tls.Dial("tcp", host, cConfig)
 	if err != nil {
-		log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+		// Only if there's a certificate error, retry to capture the chain
+		var unknownAuthorityErr x509.UnknownAuthorityError
+		if errors.As(err, &unknownAuthorityErr) {
+			// Retry with InsecureSkipVerify to capture the chain
+			var capturedChain []*x509.Certificate
+			retryConfig := new(tls.Config)
+			*retryConfig = *cConfig
+			retryConfig.InsecureSkipVerify = true
+			
+			// Quick connection just to get the chain
+			if retryConn, retryErr := tls.Dial("tcp", host, retryConfig); retryErr == nil {
+				// tls.Dial returns a *tls.Conn directly
+				capturedChain = retryConn.ConnectionState().PeerCertificates
+				retryConn.Close()
+				log.Printf("[%s] Failed to connect to upstream host: %v%s", connID, err, extractCertificateChainInfo(err, capturedChain))
+			} else {
+				log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+			}
+		} else {
+			log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+		}
 		tlsConn.Close()
 		return
 	}
@@ -887,7 +908,30 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	// Now close both connections
 	tlsConn.Close()
 	serverConn.Close()
+}
+
+// extractCertificateChainInfo analyzes the certificate chain to identify the missing root
+func extractCertificateChainInfo(err error, chain []*x509.Certificate) string {
+	if err == nil || len(chain) == 0 {
+		return ""
+	}
 	
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthorityErr) {
+		// Find the topmost certificate in the chain
+		topCert := chain[len(chain)-1]
+		
+		// Check if it's self-signed (a root cert)
+		if topCert.Subject.String() == topCert.Issuer.String() {
+			// The root is in the chain but not trusted
+			return fmt.Sprintf(" (untrusted root CA: %s)", topCert.Subject.CommonName)
+		} else {
+			// The chain is incomplete - missing the root
+			return fmt.Sprintf(" (missing root CA: %s)", topCert.Issuer.CommonName)
+		}
+	}
+	
+	return ""
 }
 
 // replayConn is a net.Conn wrapper that replays buffered data before reading from the underlying connection
