@@ -993,6 +993,8 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, host, connID string, checkRedirects bool) {
 	// Read HTTP requests from client and forward to server
 	reader := bufio.NewReader(tlsConn)
+	serverReader := bufio.NewReader(serverConn)
+	
 	for {
 		// Read the request
 		req, err := http.ReadRequest(reader)
@@ -1055,21 +1057,22 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 			}
 		}
 		
-		// Forward request to server
+		// Forward request to server directly
 		req.RequestURI = "" // Must be cleared for client requests
 		
-		// Create a client with the existing server connection
-		client := &http.Client{
-			Transport: &http.Transport{
-				DialTLS: func(network, addr string) (net.Conn, error) {
-					return serverConn, nil
-				},
-			},
+		// Write request to server
+		err = req.Write(serverConn)
+		if err != nil {
+			log.Printf("[%s] Error writing request to server: %v", connID, err)
+			// Send error response to client
+			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			break
 		}
 		
-		resp, err := client.Do(req)
+		// Read response from server
+		resp, err := http.ReadResponse(serverReader, req)
 		if err != nil {
-			log.Printf("[%s] Error forwarding request: %v", connID, err)
+			log.Printf("[%s] Error reading response from server: %v", connID, err)
 			// Send error response to client
 			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			break
@@ -1078,7 +1081,7 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 		// Write response back to client
 		err = resp.Write(tlsConn)
 		if err != nil {
-			log.Printf("[%s] Error writing response: %v", connID, err)
+			log.Printf("[%s] Error writing response to client: %v", connID, err)
 			resp.Body.Close()
 			break
 		}
