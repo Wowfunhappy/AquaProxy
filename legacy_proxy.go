@@ -341,7 +341,18 @@ func checkRedirect(reqURL *url.URL) (*url.URL, bool) {
 			if strings.HasPrefix(fullURL, fromPrefix) {
 				// Apply the redirect, preserving the path suffix
 				suffix := strings.TrimPrefix(fullURL, fromPrefix)
-				targetURL := rule.toURL.ResolveReference(&url.URL{Path: suffix})
+				
+				// Parse the target URL and append the suffix properly
+				targetURL, _ := url.Parse(rule.toURL.String())
+				if targetURL != nil {
+					// If suffix contains a query string, handle it properly
+					if idx := strings.Index(suffix, "?"); idx >= 0 {
+						targetURL.Path = targetURL.Path + suffix[:idx]
+						targetURL.RawQuery = suffix[idx+1:]
+					} else {
+						targetURL.Path = targetURL.Path + suffix
+					}
+				}
 				return targetURL, true
 			}
 		} else {
@@ -1030,28 +1041,51 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 				req.URL = targetURL
 				req.Host = targetURL.Host
 				
-				// If the target is on a different host, we need a new connection
+				// If the target is on a different host, we need to proxy to it
 				if targetURL.Host != host {
-					// Send a 307 redirect response to preserve the HTTP method
-					resp := &http.Response{
-						Status:     "307 Temporary Redirect",
-						StatusCode: 307,
-						Proto:      req.Proto,
-						ProtoMajor: req.ProtoMajor,
-						ProtoMinor: req.ProtoMinor,
-						Header:     make(http.Header),
-						Request:    req,
+					// Create a new TLS connection to the target host
+					targetConfig := new(tls.Config)
+					if p.TLSClientConfig != nil {
+						*targetConfig = *p.TLSClientConfig
 					}
-					resp.Header.Set("Location", targetURL.String())
-					resp.Header.Set("Content-Length", "0")
+					targetConfig.ServerName = targetURL.Host
 					
-					err = resp.Write(tlsConn)
+					targetConn, err := tls.Dial("tcp", targetURL.Host+":443", targetConfig)
 					if err != nil {
-						log.Printf("[%s] Error writing redirect response: %v", connID, err)
+						log.Printf("[%s] Failed to connect to redirect target %s: %v", connID, targetURL.Host, err)
+						// Send error response to client
+						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+						break
+					}
+					defer targetConn.Close()
+					
+					// Forward the request to the target
+					err = req.Write(targetConn)
+					if err != nil {
+						log.Printf("[%s] Error forwarding request to redirect target: %v", connID, err)
+						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 						break
 					}
 					
-					// Skip to next request
+					// Read response from target
+					targetReader := bufio.NewReader(targetConn)
+					resp, err := http.ReadResponse(targetReader, req)
+					if err != nil {
+						log.Printf("[%s] Error reading response from redirect target: %v", connID, err)
+						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+						break
+					}
+					
+					// Forward response to client
+					err = resp.Write(tlsConn)
+					if err != nil {
+						log.Printf("[%s] Error writing redirect response to client: %v", connID, err)
+						resp.Body.Close()
+						break
+					}
+					resp.Body.Close()
+					
+					// Continue to next request
 					continue
 				}
 			}
