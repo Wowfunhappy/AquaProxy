@@ -1238,29 +1238,73 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	// Connect to the real server
 	serverConn, err := tls.Dial("tcp", host, cConfig)
 	if err != nil {
-		// Only if there's a certificate error, retry to capture the chain
-		var unknownAuthorityErr x509.UnknownAuthorityError
-		if errors.As(err, &unknownAuthorityErr) {
-			// Retry with InsecureSkipVerify to capture the chain
-			var capturedChain []*x509.Certificate
-			retryConfig := new(tls.Config)
-			*retryConfig = *cConfig
-			retryConfig.InsecureSkipVerify = true
-			
-			// Quick connection just to get the chain
-			if retryConn, retryErr := tls.Dial("tcp", host, retryConfig); retryErr == nil {
-				// tls.Dial returns a *tls.Conn directly
-				capturedChain = retryConn.ConnectionState().PeerCertificates
-				retryConn.Close()
-				log.Printf("[%s] Failed to connect to upstream host: %v%s", connID, err, extractCertificateChainInfo(err, capturedChain))
+		// Check if there are redirects for this domain
+		domain := host
+		if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
+			domain = h
+		}
+		
+		redirectMutex.RLock()
+		rules, hasRedirects := redirectRules[domain]
+		redirectMutex.RUnlock()
+		
+		// If there are redirects, try connecting to the first redirect target
+		if hasRedirects && len(rules) > 0 {
+			// Get the first redirect rule's target host
+			targetHost := rules[0].toURL.Host
+			if targetHost != "" && targetHost != domain {
+				// Add port if not present
+				if _, _, err := net.SplitHostPort(targetHost); err != nil {
+					targetHost = targetHost + ":443"
+				}
+				
+				log.Printf("[%s] Original connection failed, trying redirect target: %s", connID, targetHost)
+				
+				// Update TLS config for new host
+				redirectConfig := new(tls.Config)
+				*redirectConfig = *cConfig
+				redirectConfig.ServerName = rules[0].toURL.Host
+				
+				// Try connecting to redirect target
+				redirectConn, redirectErr := tls.Dial("tcp", targetHost, redirectConfig)
+				if redirectErr == nil {
+					// Success! Use this connection
+					serverConn = redirectConn
+					err = nil
+					log.Printf("[%s] Successfully connected to redirect target: %s", connID, targetHost)
+				} else {
+					log.Printf("[%s] Failed to connect to redirect target %s: %v", connID, targetHost, redirectErr)
+					// Fall through to original error handling
+				}
+			}
+		}
+		
+		// If we still have an error (no redirects or redirect failed)
+		if err != nil {
+			// Only if there's a certificate error, retry to capture the chain
+			var unknownAuthorityErr x509.UnknownAuthorityError
+			if errors.As(err, &unknownAuthorityErr) {
+				// Retry with InsecureSkipVerify to capture the chain
+				var capturedChain []*x509.Certificate
+				retryConfig := new(tls.Config)
+				*retryConfig = *cConfig
+				retryConfig.InsecureSkipVerify = true
+				
+				// Quick connection just to get the chain
+				if retryConn, retryErr := tls.Dial("tcp", host, retryConfig); retryErr == nil {
+					// tls.Dial returns a *tls.Conn directly
+					capturedChain = retryConn.ConnectionState().PeerCertificates
+					retryConn.Close()
+					log.Printf("[%s] Failed to connect to upstream host: %v%s", connID, err, extractCertificateChainInfo(err, capturedChain))
+				} else {
+					log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+				}
 			} else {
 				log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
 			}
-		} else {
-			log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+			tlsConn.Close()
+			return
 		}
-		tlsConn.Close()
-		return
 	}
 	
 	// Check if domain has redirect rules
