@@ -1228,15 +1228,48 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		return
 	}
 	
+	// Check if domain has redirect rules
+	// Extract domain without port
+	domain := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		domain = h
+	}
+	
+	// Check for domain-level redirects
+	targetHost := host
+	targetDomain := domain
+	redirectMutex.RLock()
+	if rules, exists := redirectRules[domain]; exists {
+		// Look for a simple domain redirect (https://domain/ -> https://otherdomain/)
+		for _, rule := range rules {
+			if rule.isPrefix && rule.fromURL.Path == "/" && rule.fromURL.RawQuery == "" {
+				// This is a domain-level redirect
+				if targetURL := rule.toURL; targetURL != nil {
+					targetDomain = targetURL.Host
+					// Preserve the port if original had one
+					if _, port, err := net.SplitHostPort(host); err == nil {
+						targetHost = net.JoinHostPort(targetDomain, port)
+					} else {
+						targetHost = targetDomain + ":443"
+					}
+					log.Printf("[%s] Redirecting domain %s to %s", connID, domain, targetDomain)
+					break
+				}
+			}
+		}
+	}
+	hasRedirects := redirectDomains[domain]
+	redirectMutex.RUnlock()
+	
 	// Set up client TLS config for upstream connection
 	cConfig := new(tls.Config)
 	if p.TLSClientConfig != nil {
 		*cConfig = *p.TLSClientConfig
 	}
-	cConfig.ServerName = name
+	cConfig.ServerName = targetDomain
 	
 	// Connect to the real server
-	serverConn, err := tls.Dial("tcp", host, cConfig)
+	serverConn, err := tls.Dial("tcp", targetHost, cConfig)
 	if err != nil {
 		// Only if there's a certificate error, retry to capture the chain
 		var unknownAuthorityErr x509.UnknownAuthorityError
@@ -1248,7 +1281,7 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 			retryConfig.InsecureSkipVerify = true
 			
 			// Quick connection just to get the chain
-			if retryConn, retryErr := tls.Dial("tcp", host, retryConfig); retryErr == nil {
+			if retryConn, retryErr := tls.Dial("tcp", targetHost, retryConfig); retryErr == nil {
 				// tls.Dial returns a *tls.Conn directly
 				capturedChain = retryConn.ConnectionState().PeerCertificates
 				retryConn.Close()
@@ -1262,18 +1295,6 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		tlsConn.Close()
 		return
 	}
-	
-	// Check if domain has redirect rules
-	// Extract domain without port
-	domain := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		domain = h
-	}
-	
-	redirectMutex.RLock()
-	hasRedirects := redirectDomains[domain]
-	redirectMutex.RUnlock()
-	
 	
 	// If URL logging is enabled OR domain has redirects, parse HTTP requests
 	if *logURLs || hasRedirects {
