@@ -54,6 +54,7 @@ var (
 	
 	// Command line flags
 	logURLs = flag.Bool("log-urls", false, "Print URLs being accessed in MITM mode")
+	forceMITM = flag.Bool("force-mitm", false, "Force MITM mode for all connections")
 	
 	// URL redirect configuration
 	redirectRules = make(map[string][]redirectRule)
@@ -541,6 +542,9 @@ func main() {
 	if *logURLs {
 		log.Println("URL logging is ENABLED")
 	}
+	if *forceMITM {
+		log.Println("Force MITM mode is ENABLED - all connections will be intercepted")
+	}
 	log.Fatal(http.ListenAndServe(":6531", p))
 }
 
@@ -862,13 +866,15 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	
 	
 	// Route based on client capabilities and redirect rules
-	if clientHello.isModernClient && !hasRedirects {
-		// Modern client detected and no redirects - use passthrough mode
+	if clientHello.isModernClient && !hasRedirects && !*forceMITM {
+		// Modern client detected, no redirects, and force MITM not enabled - use passthrough mode
 		log.Printf("[%s] PASSTHROUGH: %s", connID, host)
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
-		// Legacy client OR domain has redirects - use MITM mode
-		if hasRedirects {
+		// Legacy client OR domain has redirects OR force MITM enabled - use MITM mode
+		if *forceMITM {
+			log.Printf("[%s] MITM (forced): %s", connID, host)
+		} else if hasRedirects {
 			log.Printf("[%s] MITM (redirects): %s", connID, host)
 		} else {
 			log.Printf("[%s] MITM (legacy): %s", connID, host)
