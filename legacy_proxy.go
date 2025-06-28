@@ -601,6 +601,15 @@ func createCertVerifier(rootCAs *x509.CertPool) func([][]byte, [][]*x509.Certifi
 			return nil
 		}
 		
+		// If still failing, log the missing root cert info
+		var unknownAuthorityErr x509.UnknownAuthorityError
+		if errors.As(err, &unknownAuthorityErr) {
+			certInfo := extractCertificateChainInfo(err, certs)
+			if certInfo != "" {
+				log.Printf("Certificate verification failed: %v%s", err, certInfo)
+			}
+		}
+		
 		return err
 	}
 }
