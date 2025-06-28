@@ -1,5 +1,3 @@
-In the near future, the Legacy Mac Proxy package will use this Go-based proxy instead of Squid.
-
 Based on code from https://codeload.github.com/kr/mitm.
 
 To build:

@@ -34,8 +34,8 @@ var (
 
 	// Use certificates in current directory
 	
-	keyFile  = "legacy-mac-proxy-key.pem"
-	certFile = "legacy-mac-proxy-cert.pem"
+	keyFile  = "AquaProxy-key.pem"
+	certFile = "AquaProxy-cert.pem"
 	
 	// Generated certs are only used between the OS and the proxy, so prioritize speed.
 	RSAKeyLength = 1024
