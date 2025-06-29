@@ -153,13 +153,14 @@ func main() {
 	log.Println("============")
 	log.Println("1. System Preferences → Internet Accounts → Add Other Account...")
 	log.Println("2. Add a Mail account → Create...")
-	log.Println("3. Continue normally, following your email provider's IMAP configuration instructions, except substitute the following information where prompted:")
+	log.Println("3. Follow your email provider's normal IMAP setup instructions,")
+	log.Println("	except substitute the following information where prompted:")
 	if !*disableIMAP {
 		log.Println()
 		log.Println("Incoming Mail Server Info:")
 		log.Println("	Mail Server: localhost")
 		log.Println("	User Name: yourEmail@domain@imap.server")
-		log.Println("		For example: johnappleseed@icloud.com@imap.mail.me.com")
+		log.Println("		Example: johnappleseed@icloud.com@imap.mail.me.com")
 		log.Println("	Port:", *imapPort)
 		log.Println("	Disable \"Use SSL\"")
 	}
@@ -168,7 +169,7 @@ func main() {
 		log.Println("Outgoing Mail Server Info:")
 		log.Println("	SMTP Server: localhost")
 		log.Println("	User Name: yourEmail@domain@smtp.server")
-		log.Println("		For example: johnappleseed@icloud.com@smtp.mail.me.com")
+		log.Println("		Example: johnappleseed@icloud.com@smtp.mail.me.com")
 		log.Println("	Port:", *smtpPort)
 		log.Println("	Disable \"Use SSL\"")
 	}
