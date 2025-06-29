@@ -463,34 +463,75 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 	// Fallback: Use security command to export certificates. Needed on Snow Leopard.
 	log.Println("System certificate pool appears to be empty. Using security to load system certificates.")
 	
-	cmd := exec.Command("security", "find-certificate", "-a", "-p", "/System/Library/Keychains/SystemRootCertificates.keychain")
-	output, err := cmd.Output()
-	if err != nil {
-		log.Fatal("Failed to load system certificiate pool:", err)
-	}
-	
-	// Create new pool and add certificates
+	// Create new pool for certificates
 	pool := x509.NewCertPool()
 	
-	// Parse the PEM output
-	for len(output) > 0 {
-		block, rest := pem.Decode(output)
-		if block == nil {
-			break
-		}
-		output = rest
-		
-		if block.Type != "CERTIFICATE" {
-			continue
-		}
-		
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue
-		}
-		
-		pool.AddCert(cert)
+	// Load certificates from all relevant keychains
+	keychains := []string{
+		"/System/Library/Keychains/SystemRootCertificates.keychain",
+		"/Library/Keychains/System.keychain",
 	}
+	
+	// Also try to load from the default keychain search list (includes login keychain)
+	cmd := exec.Command("security", "find-certificate", "-a", "-p")
+	output, err := cmd.Output()
+	if err == nil {
+		// Parse the PEM output from default keychains
+		for len(output) > 0 {
+			block, rest := pem.Decode(output)
+			if block == nil {
+				break
+			}
+			output = rest
+			
+			if block.Type != "CERTIFICATE" {
+				continue
+			}
+			
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				continue
+			}
+			
+			pool.AddCert(cert)
+		}
+	}
+	
+	// Load from specific system keychains
+	for _, keychain := range keychains {
+		cmd := exec.Command("security", "find-certificate", "-a", "-p", keychain)
+		output, err := cmd.Output()
+		if err != nil {
+			log.Printf("Warning: Failed to load certificates from %s: %v", keychain, err)
+			continue
+		}
+		
+		// Parse the PEM output
+		for len(output) > 0 {
+			block, rest := pem.Decode(output)
+			if block == nil {
+				break
+			}
+			output = rest
+			
+			if block.Type != "CERTIFICATE" {
+				continue
+			}
+			
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				continue
+			}
+			
+			pool.AddCert(cert)
+		}
+	}
+	
+	if len(pool.Subjects()) == 0 {
+		log.Fatal("Failed to load any certificates from system keychains")
+	}
+	
+	log.Printf("Loaded %d certificates from system keychains", len(pool.Subjects()))
 	return pool, nil
 }
 
