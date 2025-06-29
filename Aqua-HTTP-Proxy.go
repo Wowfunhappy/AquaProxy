@@ -22,6 +22,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime/pprof"
 	"strings"
@@ -452,6 +453,47 @@ func loadRedirectRules() error {
 	return nil
 }
 
+func loadSystemCertPool() (*x509.CertPool, error) {
+	// Try the standard method first
+	systemRoots, err := x509.SystemCertPool()
+	if err == nil && systemRoots != nil && len(systemRoots.Subjects()) > 0 {
+		return systemRoots, nil
+	}
+	
+	// Fallback: Use security command to export certificates. Needed on Snow Leopard.
+	log.Println("System certificate pool appears to be empty. Using security to load system certificates.")
+	
+	cmd := exec.Command("security", "find-certificate", "-a", "-p", "/System/Library/Keychains/SystemRootCertificates.keychain")
+	output, err := cmd.Output()
+	if err != nil {
+		log.Fatal("Failed to load system certificiate pool:", err)
+	}
+	
+	// Create new pool and add certificates
+	pool := x509.NewCertPool()
+	
+	// Parse the PEM output
+	for len(output) > 0 {
+		block, rest := pem.Decode(output)
+		if block == nil {
+			break
+		}
+		output = rest
+		
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		
+		pool.AddCert(cert)
+	}
+	return pool, nil
+}
+
 func main() {
 	// Parse command line flags
 	flag.Parse()
@@ -513,7 +555,7 @@ func main() {
 	}
 
 	// Create a cert pool with system roots and our CA
-	systemRoots, err := x509.SystemCertPool()
+	systemRoots, err := loadSystemCertPool()
 	if err != nil {
 		log.Println("Warning: Could not load system certificate pool:", err)
 		systemRoots = x509.NewCertPool()
