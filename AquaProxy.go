@@ -60,6 +60,10 @@ var (
 	redirectRules = make(map[string][]redirectRule)
 	redirectDomains = make(map[string]bool)
 	redirectMutex sync.RWMutex
+	
+	// Custom header configuration
+	headerRules = make(map[string]headerRule)
+	headerMutex sync.RWMutex
 )
 
 // ClientHello detection structures
@@ -77,6 +81,12 @@ type redirectRule struct {
 	fromURL    *url.URL
 	toURL      *url.URL
 	isPrefix   bool // true if the fromURL ends with / and should match prefixes
+}
+
+// headerRule represents custom headers for a domain
+type headerRule struct {
+	domain  string
+	headers map[string]string // header name -> value
 }
 
 // TLS constants for parsing
@@ -451,6 +461,125 @@ func loadRedirectRules() error {
 	return nil
 }
 
+// loadHeaderRules loads custom header rules from headers.txt
+func loadHeaderRules() error {
+	headerFile := "headers.txt"
+	
+	// Check if file exists
+	if _, err := os.Stat(headerFile); os.IsNotExist(err) {
+		log.Println("No headers.txt file found, custom headers disabled")
+		return nil
+	}
+	
+	file, err := os.Open(headerFile)
+	if err != nil {
+		return fmt.Errorf("failed to open headers file: %w", err)
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	var currentDomain string
+	var currentHeaders map[string]string
+	
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		
+		// Empty line indicates end of current domain block
+		if line == "" {
+			if currentDomain != "" && len(currentHeaders) > 0 {
+				// Save the current domain's headers
+				headerMutex.Lock()
+				headerRules[currentDomain] = headerRule{
+					domain:  currentDomain,
+					headers: currentHeaders,
+				}
+				headerMutex.Unlock()
+				
+				log.Printf("Loaded %d headers for domain: %s", len(currentHeaders), currentDomain)
+				
+				// Reset for next domain
+				currentDomain = ""
+				currentHeaders = nil
+			}
+			continue
+		}
+		
+		// Check if this line contains a colon (header format)
+		if strings.Contains(line, ":") {
+			if currentDomain == "" {
+				log.Printf("Warning: Header without domain on line %d: %s", lineNum, line)
+				continue
+			}
+			
+			// Parse header
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				headerName := strings.TrimSpace(parts[0])
+				headerValue := strings.TrimSpace(parts[1])
+				
+				if currentHeaders == nil {
+					currentHeaders = make(map[string]string)
+				}
+				currentHeaders[headerName] = headerValue
+			}
+		} else {
+			// This line is a domain
+			if currentDomain != "" && len(currentHeaders) > 0 {
+				// Save previous domain's headers before starting new one
+				headerMutex.Lock()
+				headerRules[currentDomain] = headerRule{
+					domain:  currentDomain,
+					headers: currentHeaders,
+				}
+				headerMutex.Unlock()
+				
+				log.Printf("Loaded %d headers for domain: %s", len(currentHeaders), currentDomain)
+			}
+			
+			currentDomain = line
+			currentHeaders = nil
+		}
+	}
+	
+	// Handle last domain if file doesn't end with empty line
+	if currentDomain != "" && len(currentHeaders) > 0 {
+		headerMutex.Lock()
+		headerRules[currentDomain] = headerRule{
+			domain:  currentDomain,
+			headers: currentHeaders,
+		}
+		headerMutex.Unlock()
+		
+		log.Printf("Loaded %d headers for domain: %s", len(currentHeaders), currentDomain)
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading headers file: %w", err)
+	}
+	
+	headerMutex.RLock()
+	domainCount := len(headerRules)
+	headerMutex.RUnlock()
+	
+	log.Printf("Loaded custom headers for %d domains", domainCount)
+	return nil
+}
+
+// applyCustomHeaders applies custom headers for a domain to the request
+func applyCustomHeaders(req *http.Request, domain string) {
+	headerMutex.RLock()
+	rule, exists := headerRules[domain]
+	headerMutex.RUnlock()
+	
+	if exists {
+		for name, value := range rule.headers {
+			req.Header.Set(name, value)
+		}
+	}
+}
+
 func main() {
 	// Parse command line flags
 	flag.Parse()
@@ -484,6 +613,12 @@ func main() {
 	if err := loadRedirectRules(); err != nil {
 		log.Printf("Error loading redirect rules: %v", err)
 		// Continue running without redirects
+	}
+	
+	// Load custom header rules
+	if err := loadHeaderRules(); err != nil {
+		log.Printf("Error loading header rules: %v", err)
+		// Continue running without custom headers
 	}
 	
 	// Start background key generation
@@ -873,16 +1008,22 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	hasRedirects := redirectDomains[domain]
 	redirectMutex.RUnlock()
 	
+	// Check if domain has custom headers
+	headerMutex.RLock()
+	_, hasHeaders := headerRules[domain]
+	headerMutex.RUnlock()
 	
-	// Route based on client capabilities and redirect rules
-	if clientHello.isModernClient && !hasRedirects && !*forceMITM {
+	// Route based on client capabilities, redirect rules, and header rules
+	if clientHello.isModernClient && !hasRedirects && !hasHeaders && !*forceMITM {
 		// Modern client detected, no redirects, and force MITM not enabled - use passthrough mode
 		log.Printf("[%s] PASSTHROUGH: %s", connID, host)
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
-		// Legacy client OR domain has redirects OR force MITM enabled - use MITM mode
+		// Legacy client OR domain has redirects OR custom headers OR force MITM enabled - use MITM mode
 		if *forceMITM {
 			log.Printf("[%s] MITM (forced): %s", connID, host)
+		} else if hasHeaders {
+			log.Printf("[%s] MITM (headers): %s", connID, host)
 		} else if hasRedirects {
 			log.Printf("[%s] MITM (redirects): %s", connID, host)
 		} else {
@@ -1074,6 +1215,14 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 					}
 					defer targetConn.Close()
 					
+					// Apply custom headers for the target domain
+					targetDomain := targetURL.Host
+					// Strip port if present
+					if h, _, splitErr := net.SplitHostPort(targetDomain); splitErr == nil {
+						targetDomain = h
+					}
+					applyCustomHeaders(req, targetDomain)
+					
 					// Forward the request to the target
 					err = req.Write(targetConn)
 					if err != nil {
@@ -1108,6 +1257,17 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 		
 		// Forward request to server directly
 		req.RequestURI = "" // Must be cleared for client requests
+		
+		// Apply custom headers for the domain
+		domain := req.Host
+		if domain == "" {
+			domain = host
+		}
+		// Strip port if present
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			domain = h
+		}
+		applyCustomHeaders(req, domain)
 		
 		// Write request to server
 		err = req.Write(serverConn)
@@ -1318,8 +1478,13 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	hasRedirects := redirectDomains[domain]
 	redirectMutex.RUnlock()
 	
-	// If URL logging is enabled OR domain has redirects, parse HTTP requests
-	if *logURLs || hasRedirects {
+	// Check if domain has custom headers
+	headerMutex.RLock()
+	_, hasHeaders := headerRules[domain]
+	headerMutex.RUnlock()
+	
+	// If URL logging is enabled OR domain has redirects OR domain has headers, parse HTTP requests
+	if *logURLs || hasRedirects || hasHeaders {
 		// Parse and handle HTTP requests
 		p.handleMITMWithLogging(tlsConn, serverConn, host, connID, hasRedirects)
 	} else {
