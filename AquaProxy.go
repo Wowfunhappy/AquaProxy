@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -854,22 +855,6 @@ func transparentProxy(upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
 		
-		// Build full URL for redirect checking
-		fullURL := r.URL
-		if fullURL.Scheme == "" {
-			fullURL.Scheme = "http"
-		}
-		if fullURL.Host == "" {
-			fullURL.Host = r.Host
-		}
-		
-		// Check for redirects
-		if targetURL, shouldRedirect := checkRedirect(fullURL); shouldRedirect {
-			log.Printf("[%s] HTTP Redirecting %s -> %s", reqID, fullURL.String(), targetURL.String())
-			http.Redirect(w, r, targetURL.String(), http.StatusFound)
-			return
-		}
-		
 		// Log URL if flag is enabled (for plain HTTP requests)
 		if *logURLs {
 			log.Printf("[%s] HTTP URL: %s %s", reqID, r.Method, r.URL.String())
@@ -944,8 +929,56 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveConnect(w, r)
 		return
 	}
+	
+	// Create a custom director that handles redirects transparently
+	director := func(req *http.Request) {
+		httpDirector(req)
+		
+		// Check for redirects and modify the request to go to the redirect target
+		if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
+			log.Printf("HTTP proxy transparently redirecting %s -> %s", req.URL.String(), targetURL.String())
+			req.URL = targetURL
+			req.Host = targetURL.Host
+		}
+	}
+	
+	// Create a custom transport that handles connection errors
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// First try to connect to the requested address
+			conn, err := net.Dial(network, addr)
+			if err != nil {
+				// If connection fails, check if this is a redirect domain
+				host, _, _ := net.SplitHostPort(addr)
+				redirectMutex.RLock()
+				rules, hasRedirects := redirectRules[host]
+				redirectMutex.RUnlock()
+				
+				if hasRedirects && len(rules) > 0 {
+					// Try the first redirect target
+					targetHost := rules[0].toURL.Host
+					targetPort := rules[0].toURL.Port()
+					if targetPort == "" {
+						if rules[0].toURL.Scheme == "https" {
+							targetPort = "443"
+						} else {
+							targetPort = "80"
+						}
+					}
+					targetAddr := net.JoinHostPort(targetHost, targetPort)
+					
+					log.Printf("Original HTTP connection to %s failed, trying redirect target: %s", addr, targetAddr)
+					return net.Dial(network, targetAddr)
+				}
+			}
+			return conn, err
+		},
+		TLSClientConfig: p.TLSClientConfig,
+	}
+	
 	rp := &httputil.ReverseProxy{
-		Director:      httpDirector,
+		Director:      director,
+		Transport:     transport,
 		FlushInterval: p.FlushInterval,
 	}
 	p.Wrap(rp).ServeHTTP(w, r)
