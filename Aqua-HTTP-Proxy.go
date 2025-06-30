@@ -76,7 +76,6 @@ type clientHelloInfo struct {
 type redirectRule struct {
 	fromURL    *url.URL
 	toURL      *url.URL
-	isPrefix   bool // true if the fromURL ends with `/`
 }
 
 // TLS constants for parsing
@@ -333,31 +332,23 @@ func checkRedirect(reqURL *url.URL) (*url.URL, bool) {
 	
 	// Check each rule for the domain
 	for _, rule := range rules {
-		if rule.isPrefix {
-			// This is a prefix match (fromURL ended with /)
-			fromPrefix := rule.fromURL.String()
-			if strings.HasPrefix(fullURL, fromPrefix) {
-				// Apply the redirect, preserving the path suffix
-				suffix := strings.TrimPrefix(fullURL, fromPrefix)
-				
-				// Parse the target URL and append the suffix properly
-				targetURL, _ := url.Parse(rule.toURL.String())
-				if targetURL != nil {
-					// If suffix contains a query string, handle it properly
-					if idx := strings.Index(suffix, "?"); idx >= 0 {
-						targetURL.Path = targetURL.Path + suffix[:idx]
-						targetURL.RawQuery = suffix[idx+1:]
-					} else {
-						targetURL.Path = targetURL.Path + suffix
-					}
+		fromPrefix := rule.fromURL.String()
+		if strings.HasPrefix(fullURL, fromPrefix) {
+			// Apply the redirect, preserving the path suffix
+			suffix := strings.TrimPrefix(fullURL, fromPrefix)
+			
+			// Parse the target URL and append the suffix properly
+			targetURL, _ := url.Parse(rule.toURL.String())
+			if targetURL != nil {
+				// If suffix contains a query string, handle it properly
+				if idx := strings.Index(suffix, "?"); idx >= 0 {
+					targetURL.Path = targetURL.Path + suffix[:idx]
+					targetURL.RawQuery = suffix[idx+1:]
+				} else {
+					targetURL.Path = targetURL.Path + suffix
 				}
-				return targetURL, true
 			}
-		} else {
-			// This is an exact match
-			if fullURL == rule.fromURL.String() {
-				return rule.toURL, true
-			}
+			return targetURL, true
 		}
 	}
 	
@@ -414,7 +405,6 @@ func loadRedirectRules() error {
 			rule := redirectRule{
 				fromURL:  fromURL,
 				toURL:    u,
-				isPrefix: strings.HasSuffix(fromURL.Path, "/"),
 			}
 			
 			// Extract domain from fromURL
