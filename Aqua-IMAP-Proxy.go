@@ -68,48 +68,28 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 	}
 	
 	// Fallback: Use security command to export certificates. Needed on Snow Leopard.
-	log.Println("System certificate pool appears to be empty. Using security to load system certificates.")
+	log.Println("Using security to load system certificates.")
 	
-	// Create new pool for certificates
 	pool := x509.NewCertPool()
-	
-	// Load certificates from all relevant keychains
 	keychains := []string{
+		"", // empty string for default keychain search list
 		"/System/Library/Keychains/SystemRootCertificates.keychain",
 		"/Library/Keychains/System.keychain",
 	}
 	
-	// Also try to load from the default keychain search list (includes login keychain)
-	cmd := exec.Command("security", "find-certificate", "-a", "-p")
-	output, err := cmd.Output()
-	if err == nil {
-		// Parse the PEM output from default keychains
-		for len(output) > 0 {
-			block, rest := pem.Decode(output)
-			if block == nil {
-				break
-			}
-			output = rest
-			
-			if block.Type != "CERTIFICATE" {
-				continue
-			}
-			
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				continue
-			}
-			
-			pool.AddCert(cert)
-		}
-	}
-	
-	// Load from specific system keychains
+	// Load from all keychains
 	for _, keychain := range keychains {
-		cmd := exec.Command("security", "find-certificate", "-a", "-p", keychain)
+		args := []string{"find-certificate", "-a", "-p"}
+		if keychain != "" {
+			args = append(args, keychain)
+		}
+		
+		cmd := exec.Command("security", args...)
 		output, err := cmd.Output()
 		if err != nil {
-			log.Printf("Warning: Failed to load certificates from %s: %v", keychain, err)
+			if keychain != "" {
+				log.Printf("Warning: Failed to load certificates from %s: %v", keychain, err)
+			}
 			continue
 		}
 		
@@ -137,8 +117,7 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 	if len(pool.Subjects()) == 0 {
 		log.Fatal("Failed to load any certificates from system keychains")
 	}
-	
-	log.Printf("Loaded %d certificates from system keychains", len(pool.Subjects()))
+
 	return pool, nil
 }
 
@@ -189,30 +168,13 @@ func main() {
 		log.Fatal("Both IMAP and SMTP are disabled, nothing to do")
 	}
 	
-	log.Println()
-	log.Println("INSTRUCTIONS")
-	log.Println("============")
-	log.Println("1. System Preferences → Internet Accounts → Add Other Account...")
-	log.Println("2. Add a Mail account → Create...")
-	log.Println("3. Follow your email provider's normal IMAP setup instructions,")
-	log.Println("	except substitute the following information where prompted:")
-	if !*disableIMAP {
-		log.Println()
-		log.Println("Incoming Mail Server Info:")
-		log.Println("	Mail Server: localhost")
-		log.Println("	User Name: yourEmail@domain@imap.server")
-		log.Println("		Example: johnappleseed@icloud.com@imap.mail.me.com")
-		log.Println("	Port:", *imapPort)
-		log.Println("	Disable \"Use SSL\"")
-	}
-	if !*disableSMTP {
-		log.Println()
-		log.Println("Outgoing Mail Server Info:")
-		log.Println("	SMTP Server: localhost")
-		log.Println("	User Name: yourEmail@domain@smtp.server")
-		log.Println("		Example: johnappleseed@icloud.com@smtp.mail.me.com")
-		log.Println("	Port:", *smtpPort)
-		log.Println("	Disable \"Use SSL\"")
+	// Print single startup message
+	if !*disableIMAP && !*disableSMTP {
+		log.Printf("Aqua Mail Proxy started (IMAP:%d, SMTP:%d)", *imapPort, *smtpPort)
+	} else if !*disableIMAP {
+		log.Printf("Aqua Mail Proxy started (IMAP:%d)", *imapPort)
+	} else if !*disableSMTP {
+		log.Printf("Aqua Mail Proxy started (SMTP:%d)", *smtpPort)
 	}
 		
 	// Keep the main thread running
@@ -226,13 +188,13 @@ func (mp *MailProxy) Start() error {
 		return fmt.Errorf("failed to start %s proxy on port %d: %w", mp.Protocol, mp.Port, err)
 	}
 	
-	log.Printf("Starting %s proxy on port %d", mp.Protocol, mp.Port)
-	
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				log.Printf("%s proxy accept error: %v", mp.Protocol, err)
+				if mp.Debug {
+					log.Printf("%s proxy accept error: %v", mp.Protocol, err)
+				}
 				continue
 			}
 			
@@ -257,7 +219,9 @@ func (mp *MailProxy) handleConnection(clientConn net.Conn) {
 	
 	defer mc.Close()
 	
-	log.Printf("[%s] New %s connection from %s", connID, mp.Protocol, clientConn.RemoteAddr())
+	if mc.debug {
+		log.Printf("[%s] New %s connection from %s", connID, mp.Protocol, clientConn.RemoteAddr())
+	}
 	
 	// Handle based on protocol
 	if mp.Protocol == "IMAP" {
@@ -270,7 +234,7 @@ func (mp *MailProxy) handleConnection(clientConn net.Conn) {
 // handleIMAP handles IMAP protocol specifics
 func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 	// Send initial IMAP greeting
-	greeting := "* OK Legacy Mac Mail Proxy IMAP server ready\r\n"
+	greeting := "* OK AquaProxy IMAP server ready\r\n"
 	mc.writer.WriteString(greeting)
 	mc.writer.Flush()
 	
@@ -351,7 +315,9 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 			// Check if authentication succeeded
 			if strings.Contains(response, tag+" OK") {
 				mc.authenticated = true
-				log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+				if mp.Debug {
+					log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+				}
 				
 				// Switch to transparent proxy mode
 				mc.transparentProxy()
@@ -453,7 +419,9 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 				// Check if authentication succeeded
 				if strings.Contains(response, tag+" OK") {
 					mc.authenticated = true
-					log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+					if mp.Debug {
+						log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+					}
 					
 					// Switch to transparent proxy mode
 					mc.transparentProxy()
@@ -478,7 +446,7 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 			mc.writer.Flush()
 			
 		} else if command == "LOGOUT" {
-			mc.writer.WriteString("* BYE Legacy Mac Mail Proxy logging out\r\n")
+			mc.writer.WriteString("* BYE AquaProxy logging out\r\n")
 			mc.writer.WriteString(fmt.Sprintf("%s OK LOGOUT completed\r\n", tag))
 			mc.writer.Flush()
 			return
@@ -494,7 +462,7 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 // handleSMTP handles SMTP protocol specifics
 func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 	// Send initial SMTP greeting
-	greeting := "220 localhost Legacy Mac Mail Proxy SMTP server ready\r\n"
+	greeting := "220 localhost AquaProxy SMTP server ready\r\n"
 	mc.writer.WriteString(greeting)
 	mc.writer.Flush()
 	
@@ -606,7 +574,9 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				mc.writer.Flush()
 				
 				mc.authenticated = true
-				log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+				if mp.Debug {
+					log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+				}
 				
 				// Switch to transparent proxy mode
 				mc.transparentProxy()
@@ -677,7 +647,9 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				mc.writer.Flush()
 				
 				mc.authenticated = true
-				log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+				if mp.Debug {
+					log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
+				}
 				
 				// Switch to transparent proxy mode
 				mc.transparentProxy()
@@ -725,7 +697,9 @@ func (mc *MailConnection) parseUsername(username string) error {
 		return fmt.Errorf("invalid target server")
 	}
 	
-	log.Printf("[%s] Parsed username: %s -> server: %s", mc.id, mc.realUsername, mc.targetServer)
+	if mc.debug {
+		log.Printf("[%s] Parsed username: %s -> server: %s", mc.id, mc.realUsername, mc.targetServer)
+	}
 	return nil
 }
 
@@ -737,7 +711,9 @@ func (mc *MailConnection) connectToServer(tlsConfig *tls.Config, port int) error
 		server = fmt.Sprintf("%s:%d", server, port)
 	}
 	
-	log.Printf("[%s] Connecting to %s", mc.id, server)
+	if mc.debug {
+		log.Printf("[%s] Connecting to %s", mc.id, server)
+	}
 	
 	// For SMTP on port 465, use direct TLS
 	if mc.protocol == "SMTP" && port == 465 {
@@ -970,7 +946,9 @@ func (mc *MailConnection) readIMAPResponse(tag string) (string, error) {
 
 // transparentProxy switches to transparent proxy mode after authentication
 func (mc *MailConnection) transparentProxy() {
-	log.Printf("[%s] Switching to transparent proxy mode", mc.id)
+	if mc.debug {
+		log.Printf("[%s] Switching to transparent proxy mode", mc.id)
+	}
 	
 	// For SMTP, we need to rewrite MAIL FROM commands
 	if mc.protocol == "SMTP" {

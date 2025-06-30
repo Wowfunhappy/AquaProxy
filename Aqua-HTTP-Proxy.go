@@ -33,30 +33,28 @@ import (
 
 var (
 	hostname, _ = os.Hostname()
-
-	// Use certificates in current directory
 	
 	keyFile  = "AquaProxy-key.pem"
 	certFile = "AquaProxy-cert.pem"
 	
-	// Generated certs are only used between the OS and the proxy, so prioritize speed.
+	// Generated certs are only used between the OS and the proxy. Prioritize speed.
 	RSAKeyLength = 1024
 	
-	// In-memory cache for certificates fetched via AIA
+	// Cache for certificates fetched via AIA
 	aiaCertCache = make(map[string]*x509.Certificate)
 	aiaCacheMutex sync.RWMutex
 	
-	// In-memory cache for generated leaf certificates
+	// Cache for generated leaf certificates
 	leafCertCache = make(map[string]*tls.Certificate)
 	leafCertMutex sync.RWMutex
 	
 	// Pre-generated RSA keys for fast certificate generation
-	// This eliminates the expensive RSA key generation step
 	keyPool = make(chan *rsa.PrivateKey, 20)
 	
 	// Command line flags
-	logURLs = flag.Bool("log-urls", false, "Print URLs being accessed in MITM mode")
+	logURLs = flag.Bool("log-urls", false, "Print every URL accessed in MITM mode")
 	forceMITM = flag.Bool("force-mitm", false, "Force MITM mode for all connections")
+	cpuProfile = flag.Bool("cpu-profile", false, "Enable CPU profiling to legacy_proxy_cpu.prof")
 	
 	// URL redirect configuration
 	redirectRules = make(map[string][]redirectRule)
@@ -78,7 +76,7 @@ type clientHelloInfo struct {
 type redirectRule struct {
 	fromURL    *url.URL
 	toURL      *url.URL
-	isPrefix   bool // true if the fromURL ends with / and should match prefixes
+	isPrefix   bool // true if the fromURL ends with `/`
 }
 
 // TLS constants for parsing
@@ -281,12 +279,9 @@ func peekClientHello(conn net.Conn) (*clientHelloInfo, error) {
 func startKeyPool() {
 	// Start key generation in background
 	go func() {
-		log.Println("Starting background key generation")
 		
 		// Set lower CPU priority for this goroutine
-		if err := syscall.Setpriority(syscall.PRIO_PROCESS, 0, 19); err != nil {
-			log.Printf("Warning: could not set lower CPU priority: %v", err)
-		}
+		syscall.Setpriority(syscall.PRIO_PROCESS, 0, 19)
 		
 		for {
 			// First check if the pool needs more keys
@@ -375,7 +370,7 @@ func loadRedirectRules() error {
 	
 	// Check if file exists
 	if _, err := os.Stat(redirectFile); os.IsNotExist(err) {
-		log.Println("No redirects.txt file found, URL redirects disabled")
+		log.Println("Warning: no redirects.txt file found")
 		return nil
 	}
 	
@@ -430,8 +425,6 @@ func loadRedirectRules() error {
 			redirectDomains[domain] = true
 			redirectMutex.Unlock()
 			
-			log.Printf("Loaded redirect: %s -> %s (prefix=%v)", fromURL.String(), u.String(), rule.isPrefix)
-			
 			// Reset for next pair
 			fromURL = nil
 		}
@@ -445,11 +438,6 @@ func loadRedirectRules() error {
 		log.Printf("Warning: Incomplete redirect rule (missing target URL) for: %s", fromURL.String())
 	}
 	
-	redirectMutex.RLock()
-	domainCount := len(redirectDomains)
-	redirectMutex.RUnlock()
-	
-	log.Printf("Loaded %d domains with redirect rules", domainCount)
 	return nil
 }
 
@@ -461,48 +449,28 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 	}
 	
 	// Fallback: Use security command to export certificates. Needed on Snow Leopard.
-	log.Println("System certificate pool appears to be empty. Using security to load system certificates.")
+	log.Println("Using security to load system certificates.")
 	
-	// Create new pool for certificates
 	pool := x509.NewCertPool()
-	
-	// Load certificates from all relevant keychains
 	keychains := []string{
+		"", // empty string for default keychain search list
 		"/System/Library/Keychains/SystemRootCertificates.keychain",
 		"/Library/Keychains/System.keychain",
 	}
 	
-	// Also try to load from the default keychain search list (includes login keychain)
-	cmd := exec.Command("security", "find-certificate", "-a", "-p")
-	output, err := cmd.Output()
-	if err == nil {
-		// Parse the PEM output from default keychains
-		for len(output) > 0 {
-			block, rest := pem.Decode(output)
-			if block == nil {
-				break
-			}
-			output = rest
-			
-			if block.Type != "CERTIFICATE" {
-				continue
-			}
-			
-			cert, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				continue
-			}
-			
-			pool.AddCert(cert)
-		}
-	}
-	
-	// Load from specific system keychains
+	// Load from all keychains
 	for _, keychain := range keychains {
-		cmd := exec.Command("security", "find-certificate", "-a", "-p", keychain)
+		args := []string{"find-certificate", "-a", "-p"}
+		if keychain != "" {
+			args = append(args, keychain)
+		}
+		
+		cmd := exec.Command("security", args...)
 		output, err := cmd.Output()
 		if err != nil {
-			log.Printf("Warning: Failed to load certificates from %s: %v", keychain, err)
+			if keychain != "" {
+				log.Printf("Warning: Failed to load certificates from %s: %v", keychain, err)
+			}
 			continue
 		}
 		
@@ -530,8 +498,7 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 	if len(pool.Subjects()) == 0 {
 		log.Fatal("Failed to load any certificates from system keychains")
 	}
-	
-	log.Printf("Loaded %d certificates from system keychains", len(pool.Subjects()))
+
 	return pool, nil
 }
 
@@ -540,7 +507,7 @@ func main() {
 	flag.Parse()
 	
 	// Setup CPU profiling if requested
-	if flag.NArg() > 0 && flag.Arg(0) == "cpu-profile" {
+	if *cpuProfile {
 		f, err := os.Create("legacy_proxy_cpu.prof")
 		if err != nil {
 			log.Fatal("Could not create CPU profile: ", err)
@@ -561,13 +528,12 @@ func main() {
 			os.Exit(0)
 		}()
 		
-		log.Println("CPU profiling enabled - press Ctrl+C to stop and save profile")
+		log.Println("CPU profiling enabled to legacy_proxy_cpu.prof")
 	}
 	
 	// Load redirect rules
 	if err := loadRedirectRules(); err != nil {
 		log.Printf("Error loading redirect rules: %v", err)
-		// Continue running without redirects
 	}
 	
 	// Start background key generation
@@ -578,9 +544,9 @@ func main() {
 		log.Fatal("Error loading certificate:", err)
 	}
 	
-	// Configure server side with relaxed security for older OS X clients
+	// Configure server side with relaxed security for old OS X clients
 	tlsServerConfig := &tls.Config{
-		MinVersion: tls.VersionSSL30, // Support very old protocols
+		MinVersion: tls.VersionSSL30,
 		CipherSuites: []uint16{
 			tls.TLS_RSA_WITH_RC4_128_SHA,
 			tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
@@ -598,7 +564,7 @@ func main() {
 	// Create a cert pool with system roots and our CA
 	systemRoots, err := loadSystemCertPool()
 	if err != nil {
-		log.Println("Warning: Could not load system certificate pool:", err)
+		log.Fatal("Warning: Could not load system certificate pool:", err)
 		systemRoots = x509.NewCertPool()
 	}
 	
@@ -621,13 +587,12 @@ func main() {
 		Wrap:             transparentProxy,
 	}
 
-	log.Println("Starting proxy on port 6531")
-	log.Println("Using certificate from:", certFile)
+	log.Printf("Aqua HTTP Proxy started on port 6531")
 	if *logURLs {
 		log.Println("URL logging is ENABLED")
 	}
 	if *forceMITM {
-		log.Println("Force MITM mode is ENABLED - all connections will be intercepted")
+		log.Println("Force MITM mode is ENABLED")
 	}
 	log.Fatal(http.ListenAndServe(":6531", p))
 }
@@ -772,7 +737,6 @@ func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool) ([]*x509.Certif
 		}
 	}
 	
-	// Try verification with the enhanced intermediate pool
 	opts := x509.VerifyOptions{
 		Roots:         rootCAs,
 		Intermediates: intermediates,
@@ -798,17 +762,14 @@ func loadCA() (cert tls.Certificate, err error) {
 	return
 }
 
-// transparentProxy passes the request through without modifying content
 func transparentProxy(upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := fmt.Sprintf("%p", r) // Create a unique ID for this request
+		reqID := fmt.Sprintf("%p", r)
 		
-		// Log URL if flag is enabled (for plain HTTP requests)
 		if *logURLs {
 			log.Printf("[%s] HTTP URL: %s %s", reqID, r.Method, r.URL.String())
 		}
 		
-		// Capture response
 		rw := &responseTracker{
 			ResponseWriter: w,
 			reqID:          reqID,
@@ -838,11 +799,7 @@ func (rw *responseTracker) Write(b []byte) (int, error) {
 	if !rw.wroteHeader {
 		rw.WriteHeader(http.StatusOK)
 	}
-	n, err := rw.ResponseWriter.Write(b)
-	if err != nil {
-		log.Printf("[%s] Error writing response: %v", rw.reqID, err)
-	}
-	return n, err
+	return rw.ResponseWriter.Write(b)
 }
 
 // Proxy is a forward proxy that substitutes its own certificate
@@ -884,7 +841,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		
 		// Check for redirects and modify the request to go to the redirect target
 		if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
-			log.Printf("HTTP proxy transparently redirecting %s -> %s", req.URL.String(), targetURL.String())
+			log.Printf("Redirecting %s → %s", req.URL.String(), targetURL.String())
 			req.URL = targetURL
 			req.Host = targetURL.Host
 		}
@@ -915,7 +872,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					}
 					targetAddr := net.JoinHostPort(targetHost, targetPort)
 					
-					log.Printf("Original HTTP connection to %s failed, trying redirect target: %s", addr, targetAddr)
 					return net.Dial(network, targetAddr)
 				}
 			}
@@ -972,7 +928,6 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	// Peek at the ClientHello to determine routing
 	clientHello, err := peekClientHello(clientConn)
 	if err != nil {
-		log.Printf("[%s] Failed to peek ClientHello: %v - falling back to MITM mode", connID, err)
 		// Fall back to MITM mode if we can't parse the ClientHello
 		p.serveMITM(clientConn, host, name, nil, connID)
 		return
@@ -989,21 +944,12 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	hasRedirects := redirectDomains[domain]
 	redirectMutex.RUnlock()
 	
-	
 	// Route based on client capabilities and redirect rules
 	if clientHello.isModernClient && !hasRedirects && !*forceMITM {
 		// Modern client detected, no redirects, and force MITM not enabled - use passthrough mode
-		log.Printf("[%s] PASSTHROUGH: %s", connID, host)
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
 		// Legacy client OR domain has redirects OR force MITM enabled - use MITM mode
-		if *forceMITM {
-			log.Printf("[%s] MITM (forced): %s", connID, host)
-		} else if hasRedirects {
-			log.Printf("[%s] MITM (redirects): %s", connID, host)
-		} else {
-			log.Printf("[%s] MITM (legacy): %s", connID, host)
-		}
 		p.serveMITM(clientConn, host, name, clientHello, connID)
 	}
 }
@@ -1011,7 +957,6 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 	// Create a cache key from the domain names
 	cacheKey := names[0]
-	log.Printf("Certificate requested for: %s", cacheKey)
 	
 	// Check if we have a cached certificate for this domain
 	leafCertMutex.RLock()
@@ -1021,13 +966,11 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 	if found {
 		// Check if the certificate is still valid (has not expired)
 		if time.Now().Before(cachedCert.Leaf.NotAfter) {
-			log.Printf("Using cached certificate for: %s (expires: %s)", cacheKey, cachedCert.Leaf.NotAfter)
 			// Create a defensive copy of the certificate to prevent shared state issues
 			certCopy := new(tls.Certificate)
 			*certCopy = *cachedCert
 			return certCopy, nil
 		}
-		log.Printf("Cached certificate for %s has expired, regenerating", cacheKey)
 		// Certificate expired, remove from cache
 		leafCertMutex.Lock()
 		delete(leafCertCache, cacheKey)
@@ -1040,8 +983,6 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 		log.Printf("Error generating certificate for %s: %v", cacheKey, err)
 		return nil, err
 	}
-	
-	log.Printf("Successfully generated new certificate for: %s (expires: %s)", cacheKey, cert.Leaf.NotAfter)
 	
 	// Cache the new certificate
 	leafCertMutex.Lock()
@@ -1072,11 +1013,7 @@ func dnsName(addr string) string {
 
 // copyData copies data between connections without closing them
 func copyData(dst, src net.Conn, connID, direction string) {
-	_, err := io.Copy(dst, src)
-	
-	if err != nil && err != io.EOF {
-		log.Printf("[%s] %s copy error: %v", connID, direction, err)
-	}
+	io.Copy(dst, src)
 }
 
 // passthroughConnection handles a connection in passthrough mode without TLS interception
@@ -1128,7 +1065,6 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	// Now close both connections fully
 	clientConn.Close()
 	serverConn.Close()
-	
 }
 
 // handleMITMWithLogging handles MITM connections with HTTP parsing and URL logging/redirects
@@ -1166,7 +1102,7 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 		// Check for redirects if enabled for this domain
 		if checkRedirects {
 			if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
-				log.Printf("[%s] Redirecting %s -> %s", connID, req.URL.String(), targetURL.String())
+				log.Printf("[%s] Redirecting %s → %s", connID, req.URL.String(), targetURL.String())
 				
 				// Update request to point to new URL
 				req.URL = targetURL
@@ -1183,7 +1119,6 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 					
 					targetConn, err := tls.Dial("tcp", targetURL.Host+":443", targetConfig)
 					if err != nil {
-						log.Printf("[%s] Failed to connect to redirect target %s: %v", connID, targetURL.Host, err)
 						// Send error response to client
 						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 						break
@@ -1339,7 +1274,7 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	// Perform TLS handshake
 	err = tlsConn.Handshake()
 	if err != nil {
-		log.Printf("[%s] TLS handshake error: %v", connID, err)
+		//log.Printf("[%s] TLS handshake error: %v", connID, err)
 		tlsConn.Close()
 		return
 	}
@@ -1374,7 +1309,6 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 					targetHost = targetHost + ":443"
 				}
 				
-				log.Printf("[%s] Original connection failed, trying redirect target: %s", connID, targetHost)
 				
 				// Update TLS config for new host
 				redirectConfig := new(tls.Config)
@@ -1387,10 +1321,6 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 					// Success! Use this connection
 					serverConn = redirectConn
 					err = nil
-					log.Printf("[%s] Successfully connected to redirect target: %s", connID, targetHost)
-				} else {
-					log.Printf("[%s] Failed to connect to redirect target %s: %v", connID, targetHost, redirectErr)
-					// Fall through to original error handling
 				}
 			}
 		}
@@ -1439,14 +1369,12 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		// Parse and handle HTTP requests
 		p.handleMITMWithLogging(tlsConn, serverConn, host, connID, hasRedirects)
 	} else {
-		// Use efficient raw TCP/TLS forwarding (original behavior)
+		// Use efficient raw TCP/TLS forwarding
 		done := make(chan bool, 2)
 		
 		// Client to server
 		go func() {
 			copyData(serverConn, tlsConn, connID, "Client→Server")
-			// For TLS connections, we can't use half-close, but we avoid closing
-			// the connection until both directions are done
 			done <- true
 		}()
 		
@@ -1527,7 +1455,6 @@ func genCert(ca *tls.Certificate, names []string) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("failed to generate serial number: %s", err)
 	}
 	
-	// Use a more compatible signature algorithm for older clients
 	tmpl := &x509.Certificate{
 		SerialNumber:          serialNumber,
 		Subject:               pkix.Name{CommonName: names[0]},
@@ -1536,10 +1463,9 @@ func genCert(ca *tls.Certificate, names []string) (*tls.Certificate, error) {
 		KeyUsage:              leafUsage,
 		BasicConstraintsValid: true,
 		DNSNames:              names,
-		SignatureAlgorithm:    x509.SHA256WithRSA, // More compatible than ECDSA with SHA512
+		SignatureAlgorithm:    x509.SHA256WithRSA,
 	}
 	
-	// Get a pre-generated key from the pool instead of generating a new one
 	key, err := getKey()
 	if err != nil {
 		return nil, err
