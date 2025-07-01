@@ -23,6 +23,7 @@ var (
 	debug     = flag.Bool("debug", false, "Enable debug logging")
 	disableIMAP = flag.Bool("no-imap", false, "Disable IMAP proxy")
 	disableSMTP = flag.Bool("no-smtp", false, "Disable SMTP proxy")
+	allowRemoteConnections = flag.Bool("allow-remote-connections", false, "Allow connections from non-localhost addresses")
 )
 
 // MailProxy handles IMAP and SMTP proxy connections
@@ -176,7 +177,9 @@ func main() {
 	} else if !*disableSMTP {
 		log.Printf("Aqua Mail Proxy started (SMTP:%d)", *smtpPort)
 	}
-		
+	if *allowRemoteConnections {
+		log.Println("Remote connections are ALLOWED")
+	}		
 	// Keep the main thread running
 	select {}
 }
@@ -207,6 +210,28 @@ func (mp *MailProxy) Start() error {
 
 // handleConnection handles a single client connection
 func (mp *MailProxy) handleConnection(clientConn net.Conn) {
+	// Check if connection is from localhost unless allow-remote-connections is set
+	if !*allowRemoteConnections {
+		host, _, err := net.SplitHostPort(clientConn.RemoteAddr().String())
+		if err != nil {
+			if mp.Debug {
+				log.Printf("Error parsing remote address: %v", err)
+			}
+			clientConn.Close()
+			return
+		}
+		
+		// Check if the connection is from localhost
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			if mp.Debug {
+				log.Printf("Rejected non-localhost connection from %s", host)
+			}
+			clientConn.Close()
+			return
+		}
+	}
+	
 	connID := fmt.Sprintf("%s-%p", mp.Protocol, clientConn)
 	mc := &MailConnection{
 		id:         connID,

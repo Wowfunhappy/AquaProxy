@@ -55,6 +55,7 @@ var (
 	logURLs = flag.Bool("log-urls", false, "Print every URL accessed in MITM mode")
 	forceMITM = flag.Bool("force-mitm", false, "Force MITM mode for all connections")
 	cpuProfile = flag.Bool("cpu-profile", false, "Enable CPU profiling to legacy_proxy_cpu.prof")
+	allowRemoteConnections = flag.Bool("allow-remote-connections", false, "Allow connections from non-localhost addresses")
 	
 	// URL redirect configuration
 	redirectRules = make(map[string][]redirectRule)
@@ -584,6 +585,9 @@ func main() {
 	if *forceMITM {
 		log.Println("Force MITM mode is ENABLED")
 	}
+	if *allowRemoteConnections {
+		log.Println("Remote connections are ALLOWED")
+	}
 	log.Fatal(http.ListenAndServe(":6531", p))
 }
 
@@ -820,6 +824,21 @@ type Proxy struct {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	
+	if !*allowRemoteConnections {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "Invalid remote address", http.StatusBadRequest)
+			return
+		}
+		
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			http.Error(w, "Remote connections not allowed", http.StatusForbidden)
+			return
+		}
+	}
+	
 	if r.Method == "CONNECT" {
 		p.serveConnect(w, r)
 		return
