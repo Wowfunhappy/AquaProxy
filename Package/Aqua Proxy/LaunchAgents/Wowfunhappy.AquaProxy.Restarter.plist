@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+	<key>Label</key>
+	<string>Wowfunhappy.AquaProxy.Restarter</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>
+			launchctl stop Wowfunhappy.AquaProxy.HTTP
+			launchctl stop Wowfunhappy.AquaProxy.IMAP
+			launchctl start Wowfunhappy.AquaProxy.HTTP
+			launchctl start Wowfunhappy.AquaProxy.IMAP
+		</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<false/>
+
+	<key>WatchPaths</key>
+	<array>
+		<string>/Library/AquaProxy/redirects.txt</string>
+		<string>/Library/AquaProxy/flags.txt</string>
+	</array>
+
+</dict>
+</plist>

@@ -23,10 +23,5 @@
 		<true/>
 	</dict>
 
-	<key>WatchPaths</key>
-	<array>
-		<string>/Library/AquaProxy/redirects.txt</string>
-	</array>
-
 </dict>
 </plist>
