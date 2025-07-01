@@ -1,0 +1,63 @@
+<!--
+
+Sets environment variables used by CLI tools according to proxy settings in System Preferences.
+
+-->
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>Wowfunhappy.AquaProxy.SyncProxiesWithShell.plist</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>
+			set_proxy_env() {
+				# Get proxy settings from System Preferences
+				local enabled=$(scutil --proxy | grep "$1Enable" | awk '{print $3}')
+				local host=$(scutil --proxy | grep "$1Proxy" | awk '{print $3}')
+				local port=$(scutil --proxy | grep "$1Port" | awk '{print $3}')
+				
+				if [ "$enabled" = "1" ] &amp;&amp; [ -n "$host" ]
+				then
+					if [ -z "$port" ]
+					then
+						port=$3
+					fi
+					
+					if [ "$1" = "SOCKS" ]
+					then
+						launchctl setenv "$2" "socks://${host}:${port}"
+					else
+						launchctl setenv "$2" "http://${host}:${port}"
+					fi
+				else
+					launchctl unsetenv "$2"
+				fi
+			}
+
+			set_proxy_env "HTTP" "HTTP_PROXY" "8080"
+			set_proxy_env "HTTPS" "HTTPS_PROXY" "8080"
+			set_proxy_env "FTP" "FTP_PROXY" "21"
+			set_proxy_env "SOCKS" "SOCKS_PROXY" "1080"
+
+			EXCEPTIONS=$(scutil --proxy | grep "ExceptionsList" -A 50 | grep -E "^\s+[0-9]+" | awk '{print $3}' | tr '\n' ',' | sed 's/,$//')
+			if [ -n "$EXCEPTIONS" ]
+			then
+				launchctl setenv "NO_PROXY" "$EXCEPTIONS"
+			else
+				launchctl unsetenv "NO_PROXY"
+			fi
+		</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>WatchPaths</key>
+	<array>
+		<string>/Library/Preferences/SystemConfiguration/preferences.plist</string>
+	</array>
+</dict>
+</plist>
