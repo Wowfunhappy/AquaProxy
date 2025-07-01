@@ -494,6 +494,12 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 }
 
 func main() {
+	// Read flags from flags.txt if it exists
+	if data, err := ioutil.ReadFile("flags.txt"); err == nil {
+		flags := strings.Fields(string(data))
+		os.Args = append([]string{os.Args[0]}, append(flags, os.Args[1:]...)...)
+	}
+	
 	// Parse command line flags
 	flag.Parse()
 	

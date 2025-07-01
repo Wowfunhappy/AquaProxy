@@ -9,8 +9,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -123,6 +125,12 @@ func loadSystemCertPool() (*x509.CertPool, error) {
 }
 
 func main() {
+	// Read flags from flags.txt if it exists
+	if data, err := ioutil.ReadFile("flags.txt"); err == nil {
+		flags := strings.Fields(string(data))
+		os.Args = append([]string{os.Args[0]}, append(flags, os.Args[1:]...)...)
+	}
+	
 	flag.Parse()
 	
 	// Create TLS config for upstream connections
