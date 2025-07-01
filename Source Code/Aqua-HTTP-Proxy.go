@@ -501,7 +501,9 @@ func main() {
 	}
 	
 	// Parse command line flags
+	flag.CommandLine.SetOutput(io.Discard)
 	flag.Parse()
+	flag.CommandLine.SetOutput(os.Stderr)
 	
 	// Setup CPU profiling if requested
 	if *cpuProfile {
