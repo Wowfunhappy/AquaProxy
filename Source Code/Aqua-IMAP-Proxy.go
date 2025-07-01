@@ -131,7 +131,9 @@ func main() {
 		os.Args = append([]string{os.Args[0]}, append(flags, os.Args[1:]...)...)
 	}
 	
+	flag.CommandLine.SetOutput(io.Discard)
 	flag.Parse()
+	flag.CommandLine.SetOutput(os.Stderr)
 	
 	// Create TLS config for upstream connections
 	systemRoots, err := loadSystemCertPool()
