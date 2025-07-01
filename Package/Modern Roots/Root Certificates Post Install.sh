@@ -8,9 +8,26 @@ CERTIFICATES=(
 	"./COMODO ECC Certification Authority.crt"
 )
 
+KEYCHAINS=$(security list-keychains | tr -d '"' | tr -d ' ')
+
 for cert in "${CERTIFICATES[@]}"
 do
-	security -v add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$cert"
+	cert_name="$(basename "$cert" | sed 's/\.[^.]*$//')"
+	
+	cert_already_installed=false
+	for keychain in $KEYCHAINS
+	do
+		if security find-certificate -c "$cert_name" "$keychain" >/dev/null 2>&1
+		then
+			cert_already_installed=true
+			break
+		fi
+	done
+	
+	if [ "$cert_already_installed" = false ]
+	then
+		security -v add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$cert"
+	fi
 done
 
 if (( $(echo "${OSTYPE:6} < 11" | bc -l) ))
