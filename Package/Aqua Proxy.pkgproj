@@ -532,9 +532,9 @@
 				<key>POSTINSTALL_PATH</key>
 				<dict>
 					<key>PATH</key>
-					<string>/Users/Jonathan/Developer/Aqua Proxy/Aqua Proxy/Aqua Proxy Post Install.sh</string>
+					<string>Aqua Proxy/Aqua Proxy Post Install.sh</string>
 					<key>PATH_TYPE</key>
-					<integer>0</integer>
+					<integer>1</integer>
 				</dict>
 				<key>PREINSTALL_PATH</key>
 				<dict>
@@ -569,7 +569,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2025.06.30</string>
+				<string>2025.07.01</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1136,7 +1136,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2025.06.30</string>
+				<string>2025.07.01</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1623,9 +1623,9 @@
 						<key>GID</key>
 						<integer>0</integer>
 						<key>PATH</key>
-						<string>/Users/Jonathan/Developer/Aqua Proxy/Modern Roots/DigiCert Global Root G2.cer</string>
+						<string>Modern Roots/DigiCert Global Root G2.cer</string>
 						<key>PATH_TYPE</key>
-						<integer>0</integer>
+						<integer>1</integer>
 						<key>PERMISSIONS</key>
 						<integer>420</integer>
 						<key>TYPE</key>
@@ -1639,9 +1639,9 @@
 						<key>GID</key>
 						<integer>0</integer>
 						<key>PATH</key>
-						<string>/Users/Jonathan/Developer/Aqua Proxy/Modern Roots/DigiCert Global Root G3.cer</string>
+						<string>Modern Roots/DigiCert Global Root G3.cer</string>
 						<key>PATH_TYPE</key>
-						<integer>0</integer>
+						<integer>1</integer>
 						<key>PERMISSIONS</key>
 						<integer>420</integer>
 						<key>TYPE</key>
@@ -1708,7 +1708,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2025.06.30</string>
+				<string>2025.07.01</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1776,14 +1776,14 @@
 										<key>LANGUAGE</key>
 										<string>English</string>
 										<key>VALUE</key>
-										<string>Installs root certificates frequently needed on the modern web:
+										<string>Adds the following contemporary root certificates to the system keychain, if needed:
 
 • ISRG Root X1
 • USERTrust RSA Certification Authority
 • DigiCert Global Root G2• DigiCert Global Root G3
 • COMODO ECC Certification Authority
 
-If you don't know what this is, leave it enabled.</string>
+These certificates are frequently needed on the modern web. If you don't know what this is, leave it enabled. AquaProxy will not be able to connect to websites unless the right root certificates are installed.</string>
 									</dict>
 								</array>
 								<key>OPTIONS</key>
@@ -1795,6 +1795,8 @@ If you don't know what this is, leave it enabled.</string>
 								</dict>
 								<key>PACKAGE_UUID</key>
 								<string>AF0C09D6-89B2-4302-8413-35B202727F41</string>
+								<key>REQUIREMENTS</key>
+								<array/>
 								<key>TITLE</key>
 								<array/>
 								<key>TYPE</key>
@@ -1971,9 +1973,9 @@ If you don't know what this is, leave it enabled.</string>
 						<key>VALUE</key>
 						<dict>
 							<key>PATH</key>
-							<string>/Users/Jonathan/Developer/Aqua Proxy/Summary.rtf</string>
+							<string>Summary.rtf</string>
 							<key>PATH_TYPE</key>
-							<integer>0</integer>
+							<integer>1</integer>
 						</dict>
 					</dict>
 				</array>
@@ -2001,7 +2003,7 @@ If you don't know what this is, leave it enabled.</string>
 					<key>DICTIONARY</key>
 					<dict>
 						<key>IC_REQUIREMENT_OS_DISK_TYPE</key>
-						<integer>0</integer>
+						<integer>1</integer>
 						<key>IC_REQUIREMENT_OS_DISTRIBUTION_TYPE</key>
 						<integer>0</integer>
 						<key>IC_REQUIREMENT_OS_MAXIMUM_VERSION</key>
@@ -2010,7 +2012,7 @@ If you don't know what this is, leave it enabled.</string>
 						<integer>100600</integer>
 					</dict>
 					<key>IC_REQUIREMENT_CHECK_TYPE</key>
-					<integer>1</integer>
+					<integer>0</integer>
 					<key>IDENTIFIER</key>
 					<string>fr.whitebox.Packages.requirement.os</string>
 					<key>MESSAGE</key>
