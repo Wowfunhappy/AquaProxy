@@ -1,6 +1,10 @@
 #!/bin/bash
 
-cd /Library/AquaProxy && openssl req -x509 -newkey rsa:4096 -subj '/CN=Aqua Proxy' -nodes -days 999999 -keyout AquaProxy-key.pem -out AquaProxy-cert.pem
+# Clean up any old "Aqua Proxy" certificates from previous installations.
+sudo security delete-certificate -c "Aqua Proxy" /Library/Keychains/System.keychain >/dev/null 2>&1
+
+cd /Library/AquaProxy
+openssl req -x509 -newkey rsa:4096 -subj '/CN=Aqua Proxy' -nodes -days 999999 -keyout AquaProxy-key.pem -out AquaProxy-cert.pem
 security -v add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /Library/AquaProxy/AquaProxy-cert.pem
 
 for pid_uid in $(ps -axo pid,uid,args | grep -i "[l]oginwindow.app" | awk '{print $1 "," $2}'); do
