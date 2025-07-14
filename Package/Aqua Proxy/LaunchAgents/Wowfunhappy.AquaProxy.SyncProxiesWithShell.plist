@@ -39,18 +39,32 @@ Sets environment variables used by CLI tools according to proxy settings in Syst
 				fi
 			}
 
-			set_proxy_env "HTTP" "HTTP_PROXY" "8080"
-			set_proxy_env "HTTPS" "HTTPS_PROXY" "8080"
-			set_proxy_env "FTP" "FTP_PROXY" "21"
-			set_proxy_env "SOCKS" "SOCKS_PROXY" "1080"
+			apply_proxy_settings() {
+				set_proxy_env "HTTP" "HTTP_PROXY" "8080"
+				set_proxy_env "HTTPS" "HTTPS_PROXY" "8080"
+				set_proxy_env "FTP" "FTP_PROXY" "21"
+				set_proxy_env "SOCKS" "SOCKS_PROXY" "1080"
 
-			EXCEPTIONS=$(scutil --proxy | grep "ExceptionsList" -A 50 | grep -E "^\s+[0-9]+" | awk '{print $3}' | tr '\n' ',' | sed 's/,$//')
-			if [ -n "$EXCEPTIONS" ]
-			then
-				launchctl setenv "NO_PROXY" "$EXCEPTIONS"
-			else
-				launchctl unsetenv "NO_PROXY"
-			fi
+				EXCEPTIONS=$(scutil --proxy | grep "ExceptionsList" -A 50 | grep -E "^\s+[0-9]+" | awk '{print $3}' | tr '\n' ',' | sed 's/,$//')
+				if [ -n "$EXCEPTIONS" ]
+				then
+					launchctl setenv "NO_PROXY" "$EXCEPTIONS"
+				else
+					launchctl unsetenv "NO_PROXY"
+				fi
+			}
+
+			# Wait for scutil to be ready
+			for i in $(seq 1 20)
+			do
+				if scutil --proxy | grep -q "HTTPEnable\|HTTPSEnable\|FTPEnable\|SOCKSEnable"
+				then
+					apply_proxy_settings
+					exit 0
+				fi
+				WAIT_TIME=$((i * 2))
+				sleep $WAIT_TIME
+			done
 		</string>
 	</array>
 	<key>RunAtLoad</key>
