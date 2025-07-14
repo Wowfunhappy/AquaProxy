@@ -140,6 +140,10 @@ func main() {
 	if err != nil {
 		log.Println("Warning: Could not load system certificate pool:", err)
 		systemRoots = x509.NewCertPool()
+	} else {
+		if *debug {
+			log.Printf("Loaded system certificate pool with %d certificates", len(systemRoots.Subjects()))
+		}
 	}
 	
 	tlsConfig := &tls.Config{
@@ -611,7 +615,7 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				if mc.debug {
 					log.Printf("[%s] Starting SMTP authentication with %s", mc.id, mc.targetServer)
 				}
-				if err := mc.authenticateSMTP(authType, mc.realUsername, password); err != nil {
+				if err := mc.authenticateSMTP(authType, mc.realUsername, password, mp.TLSConfig); err != nil {
 					if mc.debug {
 						log.Printf("[%s] SMTP authentication failed: %v", mc.id, err)
 					}
@@ -716,7 +720,7 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				if mc.debug {
 					log.Printf("[%s] Starting SMTP authentication with %s", mc.id, mc.targetServer)
 				}
-				if err := mc.authenticateSMTP(authType, mc.realUsername, password); err != nil {
+				if err := mc.authenticateSMTP(authType, mc.realUsername, password, mp.TLSConfig); err != nil {
 					if mc.debug {
 						log.Printf("[%s] SMTP authentication failed: %v", mc.id, err)
 					}
@@ -868,7 +872,7 @@ func (mc *MailConnection) connectToServer(tlsConfig *tls.Config, port int) error
 }
 
 // authenticateSMTP performs SMTP authentication with the real server
-func (mc *MailConnection) authenticateSMTP(authType, username, password string) error {
+func (mc *MailConnection) authenticateSMTP(authType, username, password string, tlsConfig *tls.Config) error {
 	// Read server greeting
 	greeting, err := mc.serverReader.ReadString('\n')
 	if err != nil {
@@ -929,15 +933,39 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 		tlsConf := &tls.Config{
 			ServerName: mc.targetServer,
 		}
+		// CRITICAL: Copy the TLS config to get RootCAs for Snow Leopard
+		if tlsConfig != nil {
+			if mc.debug {
+				log.Printf("[%s] Copying TLS config for STARTTLS", mc.id)
+				log.Printf("[%s] Original TLS config has RootCAs: %v", mc.id, tlsConfig.RootCAs != nil)
+				if tlsConfig.RootCAs != nil {
+					log.Printf("[%s] RootCAs pool has %d subjects", mc.id, len(tlsConfig.RootCAs.Subjects()))
+				}
+			}
+			*tlsConf = *tlsConfig
+			tlsConf.ServerName = mc.targetServer
+		} else {
+			if mc.debug {
+				log.Printf("[%s] WARNING: No TLS config provided for STARTTLS!", mc.id)
+			}
+		}
 		
 		if mc.debug {
 			log.Printf("[%s] Starting TLS handshake with %s", mc.id, mc.targetServer)
+			log.Printf("[%s] TLS config ServerName: %s", mc.id, tlsConf.ServerName)
+			log.Printf("[%s] TLS config has RootCAs: %v", mc.id, tlsConf.RootCAs != nil)
+			log.Printf("[%s] TLS config MinVersion: %x", mc.id, tlsConf.MinVersion)
 		}
 		
 		tlsConn := tls.Client(mc.serverConn, tlsConf)
 		if err := tlsConn.Handshake(); err != nil {
 			if mc.debug {
 				log.Printf("[%s] TLS handshake failed: %v", mc.id, err)
+				log.Printf("[%s] Error type: %T", mc.id, err)
+				// Try to get more details about certificate errors
+				if certErr, ok := err.(x509.CertificateInvalidError); ok {
+					log.Printf("[%s] Certificate error reason: %v", mc.id, certErr.Reason)
+				}
 			}
 			return fmt.Errorf("TLS handshake failed: %w", err)
 		}
