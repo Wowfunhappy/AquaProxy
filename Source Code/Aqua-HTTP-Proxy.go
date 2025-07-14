@@ -51,11 +51,18 @@ var (
 	// Pre-generated RSA keys for fast certificate generation
 	keyPool = make(chan *rsa.PrivateKey, 20)
 	
-	// Command line flags
+	// Command line flags for HTTP proxy
 	logURLs = flag.Bool("log-urls", false, "Print every URL accessed in MITM mode")
 	forceMITM = flag.Bool("force-mitm", false, "Force MITM mode for all connections")
 	cpuProfile = flag.Bool("cpu-profile", false, "Enable CPU profiling to legacy_proxy_cpu.prof")
 	allowRemoteConnections = flag.Bool("allow-remote-connections", false, "Allow connections from non-localhost addresses")
+	
+	// Command line flags from IMAP proxy (for compatibility with shared flags.txt)
+	_ = flag.Int("imap-port", 6532, "IMAP proxy port (ignored by HTTP proxy)")
+	_ = flag.Int("smtp-port", 6533, "SMTP proxy port (ignored by HTTP proxy)")
+	_ = flag.Bool("debug", false, "Enable debug logging (ignored by HTTP proxy)")
+	_ = flag.Bool("no-imap", false, "Disable IMAP proxy (ignored by HTTP proxy)")
+	_ = flag.Bool("no-smtp", false, "Disable SMTP proxy (ignored by HTTP proxy)")
 	
 	// URL redirect configuration
 	redirectRules = make(map[string][]redirectRule)
@@ -501,9 +508,7 @@ func main() {
 	}
 	
 	// Parse command line flags
-	flag.CommandLine.SetOutput(io.Discard)
 	flag.Parse()
-	flag.CommandLine.SetOutput(os.Stderr)
 	
 	// Setup CPU profiling if requested
 	if *cpuProfile {
