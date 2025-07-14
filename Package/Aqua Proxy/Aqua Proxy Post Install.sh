@@ -6,7 +6,7 @@ sudo security delete-certificate -c "Aqua Proxy" /Library/Keychains/System.keych
 cd /Library/AquaProxy
 openssl req -x509 -newkey rsa:4096 -subj '/CN=Aqua Proxy' -nodes -days 999999 -keyout AquaProxy-key.pem -out AquaProxy-cert.pem
 security -v add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /Library/AquaProxy/AquaProxy-cert.pem
-
+sleep 2 # Make sure certificates have been fully added
 for pid_uid in $(ps -axo pid,uid,args | grep -i "[l]oginwindow.app" | awk '{print $1 "," $2}'); do
 	pid=$(echo $pid_uid | cut -d, -f1)
 	uid=$(echo $pid_uid | cut -d, -f2)
