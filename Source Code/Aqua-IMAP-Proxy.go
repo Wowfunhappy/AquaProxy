@@ -589,9 +589,18 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				}
 				
 				// Connect and authenticate
+				if mc.debug {
+					log.Printf("[%s] Attempting to connect to server on port 587", mc.id)
+				}
 				if err := mc.connectToServer(mp.TLSConfig, 587); err != nil {
+					if mc.debug {
+						log.Printf("[%s] Failed to connect on port 587: %v, trying port 465", mc.id, err)
+					}
 					// Try port 465 if 587 fails
 					if err := mc.connectToServer(mp.TLSConfig, 465); err != nil {
+						if mc.debug {
+							log.Printf("[%s] Failed to connect on port 465: %v", mc.id, err)
+						}
 						mc.writer.WriteString("535 Failed to connect to server\r\n")
 						mc.writer.Flush()
 						return
@@ -599,14 +608,31 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				}
 				
 				// Perform SMTP authentication with real server
+				if mc.debug {
+					log.Printf("[%s] Starting SMTP authentication with %s", mc.id, mc.targetServer)
+				}
 				if err := mc.authenticateSMTP(authType, mc.realUsername, password); err != nil {
+					if mc.debug {
+						log.Printf("[%s] SMTP authentication failed: %v", mc.id, err)
+					}
 					mc.writer.WriteString("535 Authentication failed\r\n")
 					mc.writer.Flush()
 					return
 				}
 				
+				if mc.debug {
+					log.Printf("[%s] SMTP authentication succeeded, sending 235 to client", mc.id)
+				}
 				mc.writer.WriteString("235 Authentication successful\r\n")
-				mc.writer.Flush()
+				if err := mc.writer.Flush(); err != nil {
+					if mc.debug {
+						log.Printf("[%s] Error flushing 235 response: %v", mc.id, err)
+					}
+					return
+				}
+				if mc.debug {
+					log.Printf("[%s] Successfully sent 235 response to client", mc.id)
+				}
 				
 				mc.authenticated = true
 				if mp.Debug {
@@ -614,7 +640,13 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				}
 				
 				// Switch to transparent proxy mode
+				if mc.debug {
+					log.Printf("[%s] About to switch to transparent proxy mode", mc.id)
+				}
 				mc.transparentProxy()
+				if mc.debug {
+					log.Printf("[%s] Returned from transparentProxy()", mc.id)
+				}
 				return
 				
 			} else if authType == "PLAIN" {
@@ -662,9 +694,18 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				}
 				
 				// Connect and authenticate
+				if mc.debug {
+					log.Printf("[%s] Attempting to connect to server on port 587", mc.id)
+				}
 				if err := mc.connectToServer(mp.TLSConfig, 587); err != nil {
+					if mc.debug {
+						log.Printf("[%s] Failed to connect on port 587: %v, trying port 465", mc.id, err)
+					}
 					// Try port 465 if 587 fails
 					if err := mc.connectToServer(mp.TLSConfig, 465); err != nil {
+						if mc.debug {
+							log.Printf("[%s] Failed to connect on port 465: %v", mc.id, err)
+						}
 						mc.writer.WriteString("535 Failed to connect to server\r\n")
 						mc.writer.Flush()
 						return
@@ -672,14 +713,31 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				}
 				
 				// Perform SMTP authentication with real server
+				if mc.debug {
+					log.Printf("[%s] Starting SMTP authentication with %s", mc.id, mc.targetServer)
+				}
 				if err := mc.authenticateSMTP(authType, mc.realUsername, password); err != nil {
+					if mc.debug {
+						log.Printf("[%s] SMTP authentication failed: %v", mc.id, err)
+					}
 					mc.writer.WriteString("535 Authentication failed\r\n")
 					mc.writer.Flush()
 					return
 				}
 				
+				if mc.debug {
+					log.Printf("[%s] SMTP authentication succeeded, sending 235 to client", mc.id)
+				}
 				mc.writer.WriteString("235 Authentication successful\r\n")
-				mc.writer.Flush()
+				if err := mc.writer.Flush(); err != nil {
+					if mc.debug {
+						log.Printf("[%s] Error flushing 235 response: %v", mc.id, err)
+					}
+					return
+				}
+				if mc.debug {
+					log.Printf("[%s] Successfully sent 235 response to client", mc.id)
+				}
 				
 				mc.authenticated = true
 				if mp.Debug {
@@ -687,7 +745,13 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 				}
 				
 				// Switch to transparent proxy mode
+				if mc.debug {
+					log.Printf("[%s] About to switch to transparent proxy mode", mc.id)
+				}
 				mc.transparentProxy()
+				if mc.debug {
+					log.Printf("[%s] Returned from transparentProxy()", mc.id)
+				}
 				return
 				
 			} else {
@@ -866,8 +930,15 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 			ServerName: mc.targetServer,
 		}
 		
+		if mc.debug {
+			log.Printf("[%s] Starting TLS handshake with %s", mc.id, mc.targetServer)
+		}
+		
 		tlsConn := tls.Client(mc.serverConn, tlsConf)
 		if err := tlsConn.Handshake(); err != nil {
+			if mc.debug {
+				log.Printf("[%s] TLS handshake failed: %v", mc.id, err)
+			}
 			return fmt.Errorf("TLS handshake failed: %w", err)
 		}
 		
@@ -877,17 +948,31 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 		mc.tlsEnabled = true
 		
 		if mc.debug {
-			log.Printf("[%s] TLS connection established", mc.id)
+			log.Printf("[%s] TLS connection established successfully", mc.id)
 		}
 		
 		// Send EHLO again after STARTTLS
+		if mc.debug {
+			log.Printf("[%s] Sending EHLO after STARTTLS", mc.id)
+		}
 		mc.serverWriter.WriteString("EHLO localhost\r\n")
-		mc.serverWriter.Flush()
+		if err := mc.serverWriter.Flush(); err != nil {
+			if mc.debug {
+				log.Printf("[%s] Error flushing EHLO after STARTTLS: %v", mc.id, err)
+			}
+			return fmt.Errorf("failed to send EHLO after STARTTLS: %w", err)
+		}
 		
 		// Read EHLO response again
+		if mc.debug {
+			log.Printf("[%s] Reading EHLO response after STARTTLS", mc.id)
+		}
 		for {
 			line, err := mc.serverReader.ReadString('\n')
 			if err != nil {
+				if mc.debug {
+					log.Printf("[%s] Error reading EHLO response after STARTTLS: %v", mc.id, err)
+				}
 				return err
 			}
 			
@@ -903,13 +988,23 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 	
 	// Perform authentication
 	if authType == "LOGIN" {
+		if mc.debug {
+			log.Printf("[%s] Sending AUTH LOGIN", mc.id)
+		}
 		mc.serverWriter.WriteString("AUTH LOGIN\r\n")
 		mc.serverWriter.Flush()
 		
 		// Read username prompt
 		response, err := mc.serverReader.ReadString('\n')
 		if err != nil {
+			if mc.debug {
+				log.Printf("[%s] Error reading AUTH LOGIN response: %v", mc.id, err)
+			}
 			return err
+		}
+		
+		if mc.debug {
+			log.Printf("[%s] AUTH LOGIN response: %s", mc.id, strings.TrimSpace(response))
 		}
 		
 		if !strings.HasPrefix(response, "334") {
@@ -917,13 +1012,23 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 		}
 		
 		// Send username
+		if mc.debug {
+			log.Printf("[%s] Sending username", mc.id)
+		}
 		mc.serverWriter.WriteString(encodeBase64(username) + "\r\n")
 		mc.serverWriter.Flush()
 		
 		// Read password prompt
 		response, err = mc.serverReader.ReadString('\n')
 		if err != nil {
+			if mc.debug {
+				log.Printf("[%s] Error reading password prompt: %v", mc.id, err)
+			}
 			return err
+		}
+		
+		if mc.debug {
+			log.Printf("[%s] Password prompt response: %s", mc.id, strings.TrimSpace(response))
 		}
 		
 		if !strings.HasPrefix(response, "334") {
@@ -931,12 +1036,18 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 		}
 		
 		// Send password
+		if mc.debug {
+			log.Printf("[%s] Sending password", mc.id)
+		}
 		mc.serverWriter.WriteString(encodeBase64(password) + "\r\n")
 		mc.serverWriter.Flush()
 		
 	} else if authType == "PLAIN" {
 		// Encode credentials
 		credentials := encodeBase64(fmt.Sprintf("\x00%s\x00%s", username, password))
+		if mc.debug {
+			log.Printf("[%s] Sending AUTH PLAIN", mc.id)
+		}
 		mc.serverWriter.WriteString(fmt.Sprintf("AUTH PLAIN %s\r\n", credentials))
 		mc.serverWriter.Flush()
 	}
@@ -944,7 +1055,14 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string) 
 	// Read authentication response
 	response, err := mc.serverReader.ReadString('\n')
 	if err != nil {
+		if mc.debug {
+			log.Printf("[%s] Error reading authentication response: %v", mc.id, err)
+		}
 		return err
+	}
+	
+	if mc.debug {
+		log.Printf("[%s] Authentication response: %s", mc.id, strings.TrimSpace(response))
 	}
 	
 	if !strings.HasPrefix(response, "235") {
@@ -985,6 +1103,20 @@ func (mc *MailConnection) transparentProxy() {
 		log.Printf("[%s] Switching to transparent proxy mode", mc.id)
 	}
 	
+	// Verify connections are established
+	if mc.clientConn == nil {
+		if mc.debug {
+			log.Printf("[%s] ERROR: clientConn is nil in transparentProxy", mc.id)
+		}
+		return
+	}
+	if mc.serverConn == nil {
+		if mc.debug {
+			log.Printf("[%s] ERROR: serverConn is nil in transparentProxy", mc.id)
+		}
+		return
+	}
+	
 	// For SMTP, we need to rewrite MAIL FROM commands
 	if mc.protocol == "SMTP" {
 		mc.transparentSMTPProxy()
@@ -1015,8 +1147,15 @@ func (mc *MailConnection) transparentProxy() {
 
 // transparentSMTPProxy handles SMTP-specific transparent proxying with MAIL FROM rewriting
 func (mc *MailConnection) transparentSMTPProxy() {
+	if mc.debug {
+		log.Printf("[%s] Entered transparentSMTPProxy", mc.id)
+	}
+	
 	// Server to client - log responses if debug enabled
 	go func() {
+		if mc.debug {
+			log.Printf("[%s] Starting server-to-client relay goroutine", mc.id)
+		}
 		scanner := bufio.NewScanner(mc.serverConn)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -1024,12 +1163,29 @@ func (mc *MailConnection) transparentSMTPProxy() {
 				log.Printf("[%s] Server response: %s", mc.id, line)
 			}
 			mc.writer.WriteString(line + "\r\n")
-			mc.writer.Flush()
+			if err := mc.writer.Flush(); err != nil {
+				if mc.debug {
+					log.Printf("[%s] Error flushing server response to client: %v", mc.id, err)
+				}
+				break
+			}
+		}
+		if err := scanner.Err(); err != nil && mc.debug {
+			log.Printf("[%s] Server scanner error: %v", mc.id, err)
+		}
+		if mc.debug {
+			log.Printf("[%s] Server-to-client relay goroutine exiting", mc.id)
 		}
 		mc.Close()
 	}()
 	
 	// Client to server - rewrite MAIL FROM commands
+	if mc.debug {
+		log.Printf("[%s] Starting client-to-server relay loop", mc.id)
+		log.Printf("[%s] clientConn type: %T", mc.id, mc.clientConn)
+		log.Printf("[%s] serverConn type: %T", mc.id, mc.serverConn)
+	}
+	
 	scanner := bufio.NewScanner(mc.clientConn)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1084,14 +1240,29 @@ func (mc *MailConnection) transparentSMTPProxy() {
 		
 		// Send the (possibly rewritten) command to server
 		mc.serverWriter.WriteString(line + "\r\n")
-		mc.serverWriter.Flush()
+		if err := mc.serverWriter.Flush(); err != nil {
+			if mc.debug {
+				log.Printf("[%s] Error flushing client command to server: %v", mc.id, err)
+			}
+			break
+		}
 		
 		// Check for QUIT command
 		if strings.ToUpper(strings.TrimSpace(line)) == "QUIT" {
+			if mc.debug {
+				log.Printf("[%s] Received QUIT command, exiting relay loop", mc.id)
+			}
 			// Read final response and close
 			mc.serverReader.ReadString('\n')
 			break
 		}
+	}
+	
+	if err := scanner.Err(); err != nil && mc.debug {
+		log.Printf("[%s] Client scanner error: %v", mc.id, err)
+	}
+	if mc.debug {
+		log.Printf("[%s] Client-to-server relay loop exited", mc.id)
 	}
 	
 	mc.Close()
