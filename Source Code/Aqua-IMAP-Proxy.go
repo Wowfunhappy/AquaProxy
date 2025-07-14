@@ -935,13 +935,6 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string, 
 		}
 		// CRITICAL: Copy the TLS config to get RootCAs for Snow Leopard
 		if tlsConfig != nil {
-			if mc.debug {
-				log.Printf("[%s] Copying TLS config for STARTTLS", mc.id)
-				log.Printf("[%s] Original TLS config has RootCAs: %v", mc.id, tlsConfig.RootCAs != nil)
-				if tlsConfig.RootCAs != nil {
-					log.Printf("[%s] RootCAs pool has %d subjects", mc.id, len(tlsConfig.RootCAs.Subjects()))
-				}
-			}
 			*tlsConf = *tlsConfig
 			tlsConf.ServerName = mc.targetServer
 		} else {
@@ -952,20 +945,12 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string, 
 		
 		if mc.debug {
 			log.Printf("[%s] Starting TLS handshake with %s", mc.id, mc.targetServer)
-			log.Printf("[%s] TLS config ServerName: %s", mc.id, tlsConf.ServerName)
-			log.Printf("[%s] TLS config has RootCAs: %v", mc.id, tlsConf.RootCAs != nil)
-			log.Printf("[%s] TLS config MinVersion: %x", mc.id, tlsConf.MinVersion)
 		}
 		
 		tlsConn := tls.Client(mc.serverConn, tlsConf)
 		if err := tlsConn.Handshake(); err != nil {
 			if mc.debug {
 				log.Printf("[%s] TLS handshake failed: %v", mc.id, err)
-				log.Printf("[%s] Error type: %T", mc.id, err)
-				// Try to get more details about certificate errors
-				if certErr, ok := err.(x509.CertificateInvalidError); ok {
-					log.Printf("[%s] Certificate error reason: %v", mc.id, certErr.Reason)
-				}
 			}
 			return fmt.Errorf("TLS handshake failed: %w", err)
 		}
