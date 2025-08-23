@@ -25,6 +25,7 @@
 	<array>
 		<string>/Library/AquaProxy/redirects.txt</string>
 		<string>/Library/AquaProxy/flags.txt</string>
+		<string>/Library/AquaProxy/no-mitm.txt</string>
 	</array>
 
 </dict>

@@ -68,11 +68,24 @@ type MailConnection struct {
 	debug        bool
 }
 
+func isSnowLeopard() bool {
+	cmd := exec.Command("sw_vers", "-productVersion")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	version := strings.TrimSpace(string(output))
+	// Snow Leopard is 10.6.x
+	return strings.HasPrefix(version, "10.6.")
+}
+
 func loadSystemCertPool() (*x509.CertPool, error) {
-	// Try the standard method first
-	systemRoots, err := x509.SystemCertPool()
-	if err == nil && systemRoots != nil && len(systemRoots.Subjects()) > 0 {
-		return systemRoots, nil
+	// Try the standard method first (unless we're on Snow Leopard)
+	if !isSnowLeopard() {
+		systemRoots, err := x509.SystemCertPool()
+		if err == nil && systemRoots != nil {
+			return systemRoots, nil
+		}
 	}
 	
 	// Fallback: Use security command to export certificates. Needed on Snow Leopard.

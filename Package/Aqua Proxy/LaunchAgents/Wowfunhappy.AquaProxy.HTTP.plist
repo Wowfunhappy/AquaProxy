@@ -14,6 +14,11 @@
 		<string>/Library/AquaProxy/Aqua-HTTP-Proxy</string>
 	</array>
 
+	<key>StandardOutPath</key>
+	<string>/tmp/Aqua-HTTP-Proxy.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/Aqua-HTTP-Proxy.error.log</string>
+
 	<key>RunAtLoad</key>
 	<true/>
 

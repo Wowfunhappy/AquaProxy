@@ -14,6 +14,11 @@
 		<string>/Library/AquaProxy/Aqua-IMAP-Proxy</string>
 	</array>
 
+	<key>StandardOutPath</key>
+	<string>/tmp/Aqua-IMAP-Proxy.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/Aqua-IMAP-Proxy.error.log</string>
+
 	<key>RunAtLoad</key>
 	<true/>
 

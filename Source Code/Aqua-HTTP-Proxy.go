@@ -68,6 +68,10 @@ var (
 	redirectRules = make(map[string][]redirectRule)
 	redirectDomains = make(map[string]bool)
 	redirectMutex sync.RWMutex
+	
+	// MITM exclusion configuration
+	excludedDomains = make(map[string]bool)
+	excludedMutex sync.RWMutex
 )
 
 // ClientHello detection structures
@@ -439,14 +443,91 @@ func loadRedirectRules() error {
 	return nil
 }
 
-func loadSystemCertPool() (*x509.CertPool, error) {
-	// Try the standard method first
-	systemRoots, err := x509.SystemCertPool()
-	if err == nil && systemRoots != nil && len(systemRoots.Subjects()) > 0 {
-		return systemRoots, nil
+// loadExclusionRules loads URLs to never MITM from no-mitm.txt
+func loadExclusionRules() error {
+	exclusionFile := "no-mitm.txt"
+	
+	// Check if file exists
+	if _, err := os.Stat(exclusionFile); os.IsNotExist(err) {
+		log.Println("Warning: no no-mitm.txt file found")
+		return nil
 	}
 	
-	// Fallback: Use security command to export certificates. Needed on Snow Leopard.
+	file, err := os.Open(exclusionFile)
+	if err != nil {
+		return fmt.Errorf("failed to open exclusion file: %w", err)
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// Parse URL or domain
+		if strings.Contains(line, "://") {
+			// It's a full URL, extract the domain
+			u, err := url.Parse(line)
+			if err != nil {
+				log.Printf("Warning: Invalid URL on line %d: %s", lineNum, line)
+				continue
+			}
+			
+			if u.Host != "" {
+				excludedMutex.Lock()
+				excludedDomains[u.Host] = true
+				excludedMutex.Unlock()
+				log.Printf("Excluding domain from MITM: %s", u.Host)
+			}
+		} else {
+			// It's just a domain
+			domain := line
+			// Remove port if present
+			if h, _, err := net.SplitHostPort(domain); err == nil {
+				domain = h
+			}
+			
+			excludedMutex.Lock()
+			excludedDomains[domain] = true
+			excludedMutex.Unlock()
+			log.Printf("Excluding domain from MITM: %s", domain)
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading exclusion file: %w", err)
+	}
+	
+	return nil
+}
+
+func isSnowLeopard() bool {
+	cmd := exec.Command("sw_vers", "-productVersion")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	version := strings.TrimSpace(string(output))
+	return strings.HasPrefix(version, "10.6.")
+}
+
+func loadSystemCertPool() (*x509.CertPool, error) {
+	// Try the standard method first (unless we're on Snow Leopard)
+	if !isSnowLeopard() {
+		systemRoots, err := x509.SystemCertPool()
+		if err == nil && systemRoots != nil {
+			return systemRoots, nil
+		}
+	}
+	
+	// On Snow Leopard, use security command to export certificates.
 	log.Println("Using security to load system certificates.")
 	
 	pool := x509.NewCertPool()
@@ -540,6 +621,11 @@ func main() {
 		log.Printf("Error loading redirect rules: %v", err)
 	}
 	
+	// Load MITM exclusion rules
+	if err := loadExclusionRules(); err != nil {
+		log.Printf("Error loading exclusion rules: %v", err)
+	}
+	
 	// Start background key generation
 	startKeyPool()
 
@@ -581,6 +667,8 @@ func main() {
 		RootCAs:    systemRoots,
 		// Let Go use default secure cipher suites for outbound connections
 		VerifyPeerCertificate: createCertVerifier(systemRoots),
+		// Enable session tickets for upstream connections
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 	}
 
 	p := &Proxy{
@@ -955,7 +1043,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Check if domain has redirect rules
+	// Check if domain has redirect rules or is excluded from MITM
 	// Extract domain without port
 	domain := host
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -966,8 +1054,16 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	hasRedirects := redirectDomains[domain]
 	redirectMutex.RUnlock()
 	
-	// Route based on client capabilities and redirect rules
-	if clientHello.isModernClient && !hasRedirects && !*forceMITM {
+	excludedMutex.RLock()
+	isExcluded := excludedDomains[domain]
+	excludedMutex.RUnlock()
+	
+	// Route based on client capabilities, redirect rules, and exclusion rules
+	if isExcluded {
+		// Domain is explicitly excluded from MITM - always use passthrough
+		log.Printf("[%s] Domain %s is excluded from MITM, using passthrough", connID, domain)
+		p.passthroughConnection(clientConn, host, clientHello, connID)
+	} else if clientHello.isModernClient && !hasRedirects && !*forceMITM {
 		// Modern client detected, no redirects, and force MITM not enabled - use passthrough mode
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
