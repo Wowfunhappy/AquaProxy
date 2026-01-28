@@ -14,5 +14,5 @@ To build:
 +	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, sslPolicy)
 -	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, policies)
 ```
-3. Build normally with `go build Aqua-HTTP-Proxy.go` and `go build Aqua-IMAP-Proxy.go`.
+3. Build normally with `go build`.
 4. Inject the MacPorts Legacy Support library and https://trac.macports.org/ticket/66749#comment:2 to make the binary run on Legacy OS X.

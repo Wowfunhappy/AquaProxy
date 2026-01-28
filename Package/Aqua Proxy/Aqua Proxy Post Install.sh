@@ -15,14 +15,12 @@ for pid_uid in $(ps -axo pid,uid,args | grep -i "[l]oginwindow.app" | awk '{prin
 	if (( $(echo "${OSTYPE:6} > 13" | bc -l) ))
 	then
 		#Running OS X 10.10 or above
-		launchctl bootstrap gui/$uid /Library/LaunchAgents/Wowfunhappy.AquaProxy.HTTP.plist
-		launchctl bootstrap gui/$uid /Library/LaunchAgents/Wowfunhappy.AquaProxy.IMAP.plist
+		launchctl bootstrap gui/$uid /Library/LaunchAgents/Wowfunhappy.AquaProxy.Proxy.plist
 		launchctl bootstrap gui/$uid /Library/LaunchAgents/Wowfunhappy.AquaProxy.SyncProxiesWithShell.plist
 		launchctl bootstrap gui/$uid /Library/LaunchAgents/Wowfunhappy.AquaProxy.Restarter.plist
 	else
 		#Running OS X 10.9 or below
-		launchctl bsexec "$pid" chroot -u "$uid" / launchctl load /Library/LaunchAgents/Wowfunhappy.AquaProxy.HTTP.plist
-		launchctl bsexec "$pid" chroot -u "$uid" / launchctl load /Library/LaunchAgents/Wowfunhappy.AquaProxy.IMAP.plist
+		launchctl bsexec "$pid" chroot -u "$uid" / launchctl load /Library/LaunchAgents/Wowfunhappy.AquaProxy.Proxy.plist
 		launchctl bsexec "$pid" chroot -u "$uid" / launchctl load /Library/LaunchAgents/Wowfunhappy.AquaProxy.SyncProxiesWithShell.plist
 		launchctl bsexec "$pid" chroot -u "$uid" / launchctl load /Library/LaunchAgents/Wowfunhappy.AquaProxy.Restarter.plist
 	fi
