@@ -2,24 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+
 	<key>Label</key>
-	<string>Wowfunhappy.AquaProxy.HTTP</string>
+	<string>Wowfunhappy.AquaProxy.Proxy</string>
+
 	<key>WorkingDirectory</key>
 	<string>/Library/AquaProxy</string>
+
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Library/AquaProxy/AquaProxy</string>
 	</array>
+
 	<key>StandardOutPath</key>
 	<string>/tmp/AquaProxy.log</string>
 	<key>StandardErrorPath</key>
 	<string>/tmp/AquaProxy.error.log</string>
+
 	<key>RunAtLoad</key>
 	<true/>
+
 	<key>KeepAlive</key>
 	<dict>
 		<key>NetworkState</key>
 		<true/>
 	</dict>
+
 </dict>
 </plist>
