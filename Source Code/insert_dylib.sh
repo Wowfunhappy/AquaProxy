@@ -1,6 +1,7 @@
 #!/bin/bash
 
-cd ~/Developer/AquaProxy/Package/Aqua\ Proxy/AquaProxy
+mkdir -p ../Package/Aqua\ Proxy/AquaProxy
+cd ../Package/Aqua\ Proxy/AquaProxy
 
 insert_dylib --inplace libWowfunhappyLegacySupport.dylib Aqua-HTTP-Proxy
 insert_dylib --inplace libMacportsLegacySupport.dylib Aqua-HTTP-Proxy
