@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# insert_dylib needs to be in $PATH
+# https://github.com/tyilo/insert_dylib
+
 mkdir -p ../Package/Aqua\ Proxy/AquaProxy
 cd ../Package/Aqua\ Proxy/AquaProxy
 
