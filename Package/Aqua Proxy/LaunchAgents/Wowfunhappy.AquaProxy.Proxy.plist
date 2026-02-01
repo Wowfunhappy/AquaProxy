@@ -4,20 +4,20 @@
 <dict>
 
 	<key>Label</key>
-	<string>Wowfunhappy.AquaProxy.IMAP</string>
+	<string>Wowfunhappy.AquaProxy.Proxy</string>
 
 	<key>WorkingDirectory</key>
 	<string>/Library/AquaProxy</string>
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Library/AquaProxy/Aqua-IMAP-Proxy</string>
+		<string>/Library/AquaProxy/AquaProxy</string>
 	</array>
 
 	<key>StandardOutPath</key>
-	<string>/tmp/Aqua-IMAP-Proxy.log</string>
+	<string>/tmp/AquaProxy.log</string>
 	<key>StandardErrorPath</key>
-	<string>/tmp/Aqua-IMAP-Proxy.error.log</string>
+	<string>/tmp/AquaProxy.error.log</string>
 
 	<key>RunAtLoad</key>
 	<true/>

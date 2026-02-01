@@ -14,7 +14,8 @@ To build:
 +	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, sslPolicy)
 -	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, policies)
 ```
-3. Build normally with `go build Aqua-HTTP-Proxy.go` and `go build Aqua-IMAP-Proxy.go`.
+
+3. Build normally with `go build`.
 4. Build [MacPorts Legacy Support](https://github.com/macports/macports-legacy-support/blob/master/BUILDING.txt) on Snow Leopard.
 5. Build [wowfunhappy-legacy-support](https://github.com/Wowfunhappy/wowfunhappy-legacy-support) (contains fixes from https://trac.macports.org/ticket/66749#comment:2).
 6. Place these dylibs in `Package/Aqua\ Proxy/AquaProxy`
