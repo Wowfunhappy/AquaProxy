@@ -14,5 +14,9 @@ To build:
 +	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, sslPolicy)
 -	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, policies)
 ```
+
 3. Build normally with `go build`.
-4. Inject the MacPorts Legacy Support library and https://trac.macports.org/ticket/66749#comment:2 to make the binary run on Legacy OS X.
+4. Build [MacPorts Legacy Support](https://github.com/macports/macports-legacy-support/blob/master/BUILDING.txt) on Snow Leopard.
+5. Build [wowfunhappy-legacy-support](https://github.com/Wowfunhappy/wowfunhappy-legacy-support) (contains fixes from https://trac.macports.org/ticket/66749#comment:2).
+6. Place these dylibs in `Package/Aqua\ Proxy/AquaProxy`
+7. Run `insert_dylib.sh` to inject the libraries.
