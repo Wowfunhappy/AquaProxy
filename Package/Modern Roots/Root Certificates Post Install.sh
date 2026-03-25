@@ -3,6 +3,7 @@
 CERTIFICATES=(
 	"./ISRG Root X1.cer"
 	"./USERTrust RSA Certification Authority.crt"
+	"./USERTrust ECC Certification Authority.crt"
 	"./DigiCert Global Root G2.cer"
 	"./DigiCert Global Root G3.cer"
 	"./COMODO ECC Certification Authority.crt"

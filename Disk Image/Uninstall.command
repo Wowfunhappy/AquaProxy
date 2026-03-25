@@ -86,6 +86,7 @@ then
 	then
 		sudo security delete-certificate -c "ISRG Root X1" /Library/Keychains/System.keychain >/dev/null 2>&1
 		sudo security delete-certificate -c "USERTrust RSA Certification Authority" /Library/Keychains/System.keychain >/dev/null 2>&1
+		sudo security delete-certificate -c "USERTrust ECC Certification Authority" /Library/Keychains/System.keychain >/dev/null 2>&1
 		sudo security delete-certificate -c "DigiCert Global Root G2" /Library/Keychains/System.keychain >/dev/null 2>&1
 		sudo security delete-certificate -c "DigiCert Global Root G3" /Library/Keychains/System.keychain >/dev/null 2>&1
 		sudo security delete-certificate -c "COMODO ECC Certification Authority" /Library/Keychains/System.keychain >/dev/null 2>&1
