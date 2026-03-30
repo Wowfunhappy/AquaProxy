@@ -1,0 +1,2 @@
+swscan.apple.com
+swdist.apple.com

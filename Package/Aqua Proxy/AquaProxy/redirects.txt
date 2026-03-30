@@ -1,0 +1,15 @@
+https://help.apple.com/Library/Documentation/Resources/Flamingo/6/flamingo.js
+https://mavericksforever.com/resources/flamingo.js
+
+https://api.twitter.com/
+https://twb.preloading.dev/
+
+https://upload.twitter.com/
+https://twb.preloading.dev/
+
+https://configuration.apple.com/configurations/internetservices/iworkapps/RemoteDefaults.plist
+https://mavericksforever.com/resources/RemoteDefaults.plist
+
+http://gspa19.ls.apple.com/
+https://gsp19-ms12.ls.apple.com/
+

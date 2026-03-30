@@ -1,0 +1,2 @@
+https://*.wikipedia.org/w/api.php?action=
+User-Agent: Legacy Mac OS X via Aqua Proxy (https://mavericksforever.com)
