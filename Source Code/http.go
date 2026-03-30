@@ -562,7 +562,7 @@ func HTTPMain() {
 		Wrap:            transparentProxy,
 	}
 
-	log.Printf("Aqua HTTP Proxy started on port 6531")
+	log.Printf("Aqua HTTP Proxy started on port %d", *httpPort)
 	if *logURLs {
 		log.Println("URL logging is ENABLED")
 	}
@@ -572,7 +572,7 @@ func HTTPMain() {
 	if *allowRemoteConnections {
 		log.Println("Remote connections are ALLOWED")
 	}
-	log.Fatal(http.ListenAndServe(":6531", p))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *httpPort), p))
 }
 
 // getIntermediateCerts retrieves cached certificates for the provided pool

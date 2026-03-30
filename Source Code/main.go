@@ -36,6 +36,7 @@ var (
 	allowRemoteConnections = flag.Bool("allow-remote-connections", false, "Allow connections from non-localhost addresses")
 
 	// Command line flags for HTTP proxy
+	httpPort   = flag.Int("http-port", 6531, "HTTP proxy port")
 	logURLs    = flag.Bool("log-urls", false, "Print every URL accessed in MITM mode (ignored by IMAP proxy)")
 	forceMITM  = flag.Bool("force-mitm", false, "Force MITM mode for all connections (ignored by IMAP proxy)")
 	cpuProfile = flag.Bool("cpu-profile", false, "Enable CPU profiling to legacy_proxy_cpu.prof (ignored by IMAP proxy)")
