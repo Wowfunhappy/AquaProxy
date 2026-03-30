@@ -53,6 +53,11 @@ var (
 	redirectDomains = make(map[string]bool)
 	redirectMutex   sync.RWMutex
 
+	// Custom header configuration
+	headerRules   = make(map[string][]headerRule)
+	headerDomains = make(map[string]bool)
+	headerMutex   sync.RWMutex
+
 	// MITM exclusion configuration
 	excludedDomains = make(map[string]bool)
 	excludedMutex   sync.RWMutex

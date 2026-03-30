@@ -46,6 +46,14 @@ type redirectRule struct {
 	toURL   *url.URL
 }
 
+// headerRule represents a custom header rule for a URL prefix or domain.
+// If urlPrefix is nil, the rule matches all requests for the domain.
+type headerRule struct {
+	domain    string
+	urlPrefix *url.URL // nil for domain-only rules
+	headers   http.Header
+}
+
 // TLS constants for parsing
 const (
 	tlsHandshakeTypeClientHello   = 0x01
@@ -323,6 +331,82 @@ func checkRedirect(reqURL *url.URL) (*url.URL, bool) {
 	return nil, false
 }
 
+// checkHeaders checks if the request URL matches any custom header rules and returns headers to apply
+func checkHeaders(reqURL *url.URL) (http.Header, bool) {
+	headerMutex.RLock()
+	defer headerMutex.RUnlock()
+
+	return matchHeaderRules(reqURL)
+}
+
+// hasHeaderRules checks if a domain has header rules, including wildcard matches
+func hasHeaderRules(domain string) bool {
+	headerMutex.RLock()
+	defer headerMutex.RUnlock()
+
+	if headerDomains[domain] {
+		return true
+	}
+	if idx := strings.Index(domain, "."); idx >= 0 {
+		if headerDomains["*"+domain[idx:]] {
+			return true
+		}
+	}
+	return false
+}
+
+// matchHeaderRules checks exact domain then wildcard. Must be called with headerMutex held.
+func matchHeaderRules(reqURL *url.URL) (http.Header, bool) {
+	fullURL := reqURL.String()
+
+	// Check exact domain first
+	if rules, exists := headerRules[reqURL.Host]; exists {
+		for _, rule := range rules {
+			if rule.urlPrefix == nil {
+				return rule.headers, true
+			}
+			if strings.HasPrefix(fullURL, rule.urlPrefix.String()) {
+				return rule.headers, true
+			}
+		}
+	}
+
+	// Check wildcard domain (e.g. *.wikipedia.org matches en.wikipedia.org)
+	if idx := strings.Index(reqURL.Host, "."); idx >= 0 {
+		wildcard := "*" + reqURL.Host[idx:]
+		if rules, exists := headerRules[wildcard]; exists {
+			for _, rule := range rules {
+				if rule.urlPrefix == nil {
+					return rule.headers, true
+				}
+				// Substitute wildcard host with actual host in the prefix
+				prefix := strings.Replace(rule.urlPrefix.String(), wildcard, reqURL.Host, 1)
+				if strings.HasPrefix(fullURL, prefix) {
+					return rule.headers, true
+				}
+			}
+		}
+	}
+
+	return nil, false
+}
+
+// applyHeaders sets or removes custom headers on a request and logs each change.
+// An empty value means the header should be removed.
+func applyHeaders(req *http.Request, headers http.Header) {
+	for key, values := range headers {
+		if len(values) == 1 && values[0] == "" {
+			log.Printf("Removing header %s on %s", key, req.URL.String())
+			req.Header.Del(key)
+		} else {
+			for _, value := range values {
+				log.Printf("Setting header %s: %s on %s", key, value, req.URL.String())
+				req.Header.Set(key, value)
+			}
+		}
+	}
+}
+
 // loadRedirectRules loads URL redirect rules from redirects.txt
 func loadRedirectRules() error {
 	redirectFile := "redirects.txt"
@@ -394,6 +478,102 @@ func loadRedirectRules() error {
 
 	if fromURL != nil {
 		log.Printf("Warning: Incomplete redirect rule (missing target URL) for: %s", fromURL.String())
+	}
+
+	return nil
+}
+
+// loadHeaderRules loads custom header rules from headers.txt
+func loadHeaderRules() error {
+	headerFile := "headers.txt"
+
+	// Check if file exists
+	if _, err := os.Stat(headerFile); os.IsNotExist(err) {
+		log.Println("Warning: no headers.txt file found")
+		return nil
+	}
+
+	file, err := os.Open(headerFile)
+	if err != nil {
+		return fmt.Errorf("failed to open headers file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	var currentURL *url.URL
+	var currentDomain string
+	var currentHeaders http.Header
+
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+
+		// Blank line ends the current group
+		if line == "" {
+			if currentDomain != "" && len(currentHeaders) > 0 {
+				rule := headerRule{
+					domain:    currentDomain,
+					urlPrefix: currentURL,
+					headers:   currentHeaders,
+				}
+				headerMutex.Lock()
+				headerRules[currentDomain] = append(headerRules[currentDomain], rule)
+				headerDomains[currentDomain] = true
+				headerMutex.Unlock()
+			}
+			currentURL = nil
+			currentDomain = ""
+			currentHeaders = nil
+			continue
+		}
+
+		if currentURL == nil && currentDomain == "" {
+			// First non-blank line in a group is the URL prefix or bare domain
+			if strings.Contains(line, "://") {
+				u, err := url.Parse(line)
+				if err != nil {
+					log.Printf("Warning: Invalid URL on line %d of headers.txt: %s", lineNum, line)
+					continue
+				}
+				currentURL = u
+				currentDomain = u.Host
+			} else {
+				// Bare domain
+				currentDomain = line
+				if h, _, err := net.SplitHostPort(line); err == nil {
+					currentDomain = h
+				}
+			}
+			currentHeaders = make(http.Header)
+		} else {
+			// Subsequent lines are headers in "Key: Value" format
+			colonIdx := strings.Index(line, ":")
+			if colonIdx < 1 {
+				log.Printf("Warning: Invalid header on line %d of headers.txt: %s", lineNum, line)
+				continue
+			}
+			key := strings.TrimSpace(line[:colonIdx])
+			value := strings.TrimSpace(line[colonIdx+1:])
+			currentHeaders.Set(key, value)
+		}
+	}
+
+	// Handle last group if file doesn't end with a blank line
+	if currentDomain != "" && len(currentHeaders) > 0 {
+		rule := headerRule{
+			domain:    currentDomain,
+			urlPrefix: currentURL,
+			headers:   currentHeaders,
+		}
+		headerMutex.Lock()
+		headerRules[currentDomain] = append(headerRules[currentDomain], rule)
+		headerDomains[currentDomain] = true
+		headerMutex.Unlock()
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading headers file: %w", err)
 	}
 
 	return nil
@@ -502,6 +682,11 @@ func HTTPMain() {
 	// Load redirect rules
 	if err := loadRedirectRules(); err != nil {
 		log.Printf("Error loading redirect rules: %v", err)
+	}
+
+	// Load custom header rules
+	if err := loadHeaderRules(); err != nil {
+		log.Printf("Error loading header rules: %v", err)
 	}
 
 	// Load MITM exclusion rules
@@ -828,7 +1013,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create a custom director that handles redirects transparently
+	// Create a custom director that handles redirects and custom headers transparently
 	director := func(req *http.Request) {
 		httpDirector(req)
 
@@ -837,6 +1022,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Redirecting %s → %s", req.URL.String(), targetURL.String())
 			req.URL = targetURL
 			req.Host = targetURL.Host
+		}
+
+		// Apply custom headers if any match
+		if headers, ok := checkHeaders(req.URL); ok {
+			applyHeaders(req, headers)
 		}
 	}
 
@@ -926,7 +1116,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if domain has redirect rules or is excluded from MITM
+	// Check if domain has redirect/header rules or is excluded from MITM
 	// Extract domain without port
 	domain := host
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -937,20 +1127,24 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	hasRedirects := redirectDomains[domain]
 	redirectMutex.RUnlock()
 
+	hasHeaders := hasHeaderRules(domain)
+
 	excludedMutex.RLock()
 	isExcluded := excludedDomains[domain]
 	excludedMutex.RUnlock()
 
-	// Route based on client capabilities, redirect rules, and exclusion rules
+	needsMITM := hasRedirects || hasHeaders
+
+	// Route based on client capabilities, redirect/header rules, and exclusion rules
 	if isExcluded {
 		// Domain is explicitly excluded from MITM - always use passthrough
 		log.Printf("[%s] Domain %s is excluded from MITM, using passthrough", connID, domain)
 		p.passthroughConnection(clientConn, host, clientHello, connID)
-	} else if clientHello.isModernClient && !hasRedirects && !*forceMITM {
-		// Modern client detected, no redirects, and force MITM not enabled - use passthrough mode
+	} else if clientHello.isModernClient && !needsMITM && !*forceMITM {
+		// Modern client detected, no redirects/headers, and force MITM not enabled - use passthrough mode
 		p.passthroughConnection(clientConn, host, clientHello, connID)
 	} else {
-		// Legacy client OR domain has redirects OR force MITM enabled - use MITM mode
+		// Legacy client OR domain has redirects/headers OR force MITM enabled - use MITM mode
 		p.serveMITM(clientConn, host, name, clientHello, connID)
 	}
 }
@@ -1100,6 +1294,11 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 			log.Printf("[%s] MITM URL: %s %s", connID, req.Method, fullURL)
 		}
 
+		// Apply custom headers if any match (check against original URL before redirect)
+		if headers, ok := checkHeaders(req.URL); ok {
+			applyHeaders(req, headers)
+		}
+
 		// Check for redirects if enabled for this domain
 		if checkRedirects {
 			if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
@@ -1108,6 +1307,11 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 				// Update request to point to new URL
 				req.URL = targetURL
 				req.Host = targetURL.Host
+
+				// Check for custom headers matching the redirect target
+				if headers, ok := checkHeaders(req.URL); ok {
+					applyHeaders(req, headers)
+				}
 
 				// If the target is on a different host, we need to proxy to it
 				if targetURL.Host != host {
@@ -1353,7 +1557,7 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		}
 	}
 
-	// Check if domain has redirect rules
+	// Check if domain has redirect or header rules
 	// Extract domain without port
 	domain := host
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -1364,8 +1568,10 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	hasRedirects := redirectDomains[domain]
 	redirectMutex.RUnlock()
 
-	// If URL logging is enabled OR domain has redirects, parse HTTP requests
-	if *logURLs || hasRedirects {
+	hasHeaders := hasHeaderRules(domain)
+
+	// If URL logging is enabled OR domain has redirects/headers, parse HTTP requests
+	if *logURLs || hasRedirects || hasHeaders {
 		// Parse and handle HTTP requests
 		p.handleMITMWithLogging(tlsConn, serverConn, host, connID, hasRedirects)
 	} else {
