@@ -20,5 +20,10 @@ To build:
 ```
 
 3. Build normally with `go build`.
-4. Place these dylibs in `Package/Aqua\ Proxy/AquaProxy`
-5. Run `insert_dylib.sh` to inject needed [compatibility](https://github.com/macports/macports-legacy-support/blob/master/BUILDING.txt) [libraries](https://trac.macports.org/ticket/66749#comment:2).
+4. Place the aquaproxy binary in `Package/Aqua\ Proxy/AquaProxy` as `aquaproxy-64`
+5. Install Go 1.13. You may need to switch to an older OS at this point; the author uses Mavericks.
+6. Use Go 1.13 to build 32-bit AquaProxy with `GOARCH=386 go build`.
+7. Place the 32 bit aquaproxy binary in binary in `Package/Aqua\ Proxy/AquaProxy` as `aquaproxy-32`
+8. Run `gen_compat_build.sh` to inject needed [compatibility](https://github.com/macports/macports-legacy-support/blob/master/BUILDING.txt) [libraries](https://trac.macports.org/ticket/66749#comment:2) and lipo the slices together. Afterwards, delete the individual `aquaproxy-64` and `aquaproxy-32`
+
+Note: If you choose to rebuild libMacPortsLegacySupport, make sure to run the build on Snow Leopard and use `make ARCHS="i386 x86_64"` so the binary will be compatible with all supported systems.

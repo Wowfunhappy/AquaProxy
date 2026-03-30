@@ -37,7 +37,7 @@ then
 	for pid_uid in $(ps -axo pid,uid,args | grep -i "[l]oginwindow.app" | awk '{print $1 "," $2}'); do
 		pid=$(echo $pid_uid | cut -d, -f1)
 		uid=$(echo $pid_uid | cut -d, -f2)
-		launchctl bsexec "$pid" chroot -u "$uid" / launchctl stop Wowfunhappy.AquaProxy.HTTP || true
-		launchctl bsexec "$pid" chroot -u "$uid" / launchctl start Wowfunhappy.AquaProxy.HTTP
+		launchctl bsexec "$pid" chroot -u "$uid" / launchctl stop Wowfunhappy.AquaProxy.Proxy || true
+		launchctl bsexec "$pid" chroot -u "$uid" / launchctl start Wowfunhappy.AquaProxy.Proxy
 	done
 fi

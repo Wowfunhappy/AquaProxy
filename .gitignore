@@ -1,11 +1,7 @@
 Build
 legacy-mac-proxy-cert.pem
 legacy-mac-proxy-key.pem
-libMacportsLegacySupport.dylib
-libWowfunhappyLegacySupport.dylib
 AquaProxy-key.pem
 AquaProxy-cert.pem
 -
 .claude
-Aqua-HTTP-Proxy
-Aqua-IMAP-Proxy

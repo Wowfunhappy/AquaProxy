@@ -9,7 +9,7 @@ Sets environment variables used by CLI tools according to proxy settings in Syst
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>Wowfunhappy.AquaProxy.SyncProxiesWithShell.plist</string>
+	<string>Wowfunhappy.AquaProxy.SyncProxiesWithShell</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/sh</string>

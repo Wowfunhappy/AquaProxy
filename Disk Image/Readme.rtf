@@ -8,11 +8,11 @@
 {\list\listtemplateid5\listhybrid{\listlevel\levelnfc0\levelnfcn0\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{decimal\}.}{\leveltext\leveltemplateid401\'02\'00.;}{\levelnumbers\'01;}\fi-360\li720\lin720 }{\listname ;}\listid5}
 {\list\listtemplateid6\listhybrid{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{disc\}}{\leveltext\leveltemplateid501\'01\uc0\u8226 ;}{\levelnumbers;}\fi-360\li720\lin720 }{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{hyphen\}}{\leveltext\leveltemplateid502\'01\uc0\u8259 ;}{\levelnumbers;}\fi-360\li1440\lin1440 }{\listname ;}\listid6}}
 {\*\listoverridetable{\listoverride\listid1\listoverridecount0\ls1}{\listoverride\listid2\listoverridecount0\ls2}{\listoverride\listid3\listoverridecount0\ls3}{\listoverride\listid4\listoverridecount0\ls4}{\listoverride\listid5\listoverridecount0\ls5}{\listoverride\listid6\listoverridecount0\ls6}}
-\margl1440\margr1440\vieww11680\viewh10080\viewkind0
+\margl1440\margr1440\vieww11980\viewh10380\viewkind0
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
 
 \f0\fs24 \cf0 Aqua Proxy\
-Version 2025.10.16
+Version 2026.03.30
 \b\fs28 \
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
 
@@ -207,9 +207,9 @@ Frequently Asked Questions
 \b Answer
 \b0 : It's difficult to provide a complete list, as it depends on your OS and what software and online services you use. If you see the error 
 \b CFNetwork SSLHandshake failed (-9824)
-\b0  in the Console app when things fail to load, that's a problem AquaProxy will fix. If you're using Mac OS X 10.11 or older, you probably want to install this proxy. Note that at this time AquaProxy will 
+\b0  in the Console app when things fail to load, that's a problem AquaProxy will fix. If you're using Mac OS X 10.9 or older, you probably want to install this proxy. Note that at this time AquaProxy will 
 \i not
-\i0  fix any problems with Apple Maps or FaceTime.\
+\i0  fix any problems with FaceTime.\
 \
 \
 
@@ -220,7 +220,7 @@ Frequently Asked Questions
 \b Answer
 \b0 : Yes, but please don't! Using an ancient operating system 
 \i and
-\i0  an ancient web browser at the same time is a good way to get hacked. Using one or the other is mostly okay for most people, but don't use both. If you are running OS X 10.8 or newer, consider using Firefox Dynasty. If you are using OS X 10.6 or 10.7, consider using InterWeb.\
+\i0  an ancient web browser at the same time is a good way to get hacked. Using one or the other is mostly okay for most people, but don't use both. If you are running OS X 10.8 or newer, consider using Firefox Dynasty or Momiji. If you are using OS X 10.6 or 10.7, consider using Powerfox.\
 \
 \
 
@@ -240,6 +240,8 @@ A huge thank you to Krackers for contributing code, reviewing my code, reverse e
 Thank you to the {\field{\*\fldinst{HYPERLINK "https://www.macports.org/"}}{\fldrslt MacPorts project}} and its contributors for the numerous legacy support libraries, patches, and toolchains which make it possible to run modern Go code on old versions of Mac OS X.\
 \
 As stated above, thank you to {\field{\*\fldinst{HYPERLINK "https://preloading.dev/"}}{\fldrslt Preloading}} for the Twitter API Bridge.\
+\
+Thank you to Pod for finding the right URLs and headers for various services.\
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
 
 \b\fs56 \cf0 \
@@ -266,10 +268,18 @@ This tells AquaProxy "send any traffic addressed addressed to
 \b twitterbridge.loganserver.net
 \b0  instead."\
 \
-To create your own redirects, add additional pairs of URLs to this file. AquaProxy will restart automatically whenever the the file is modified.\
+To create your own redirects, add additional pairs of URLs to this file. AquaProxy will restart automatically whenever this file is modified.\
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
 
 \b\fs40 \cf0 \
+Custom Headers
+\b0\fs24 \
+\
+The file 
+\b /Library/AquaProxy/headers.txt
+\b0  contains URLs followed by custom headers to apply to those URLs, separated by blank lines. Supports using wildcards for subdomains. To unset an existing header, don't put anything after the colon. AquaProxy will restart automatically whenever this file is modified.\
+
+\b\fs40 \
 Flags
 \b0\fs24 \
 \

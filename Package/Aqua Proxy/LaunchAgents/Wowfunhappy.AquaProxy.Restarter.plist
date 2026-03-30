@@ -11,10 +11,8 @@
 		<string>/bin/sh</string>
 		<string>-c</string>
 		<string>
-			launchctl stop Wowfunhappy.AquaProxy.HTTP
-			launchctl stop Wowfunhappy.AquaProxy.IMAP
-			launchctl start Wowfunhappy.AquaProxy.HTTP
-			launchctl start Wowfunhappy.AquaProxy.IMAP
+			launchctl stop Wowfunhappy.AquaProxy.Proxy
+			launchctl start Wowfunhappy.AquaProxy.Proxy
 		</string>
 	</array>
 

@@ -205,23 +205,7 @@
 											<key>GID</key>
 											<integer>0</integer>
 											<key>PATH</key>
-											<string>Aqua Proxy/LaunchAgents/Wowfunhappy.AquaProxy.HTTP.plist</string>
-											<key>PATH_TYPE</key>
-											<integer>1</integer>
-											<key>PERMISSIONS</key>
-											<integer>420</integer>
-											<key>TYPE</key>
-											<integer>3</integer>
-											<key>UID</key>
-											<integer>0</integer>
-										</dict>
-										<dict>
-											<key>CHILDREN</key>
-											<array/>
-											<key>GID</key>
-											<integer>0</integer>
-											<key>PATH</key>
-											<string>Aqua Proxy/LaunchAgents/Wowfunhappy.AquaProxy.IMAP.plist</string>
+											<string>Aqua Proxy/LaunchAgents/Wowfunhappy.AquaProxy.Proxy.plist</string>
 											<key>PATH_TYPE</key>
 											<integer>1</integer>
 											<key>PERMISSIONS</key>
@@ -569,7 +553,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2025.08.23</string>
+				<string>2026.03.30</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1671,6 +1655,22 @@
 						<key>GID</key>
 						<integer>0</integer>
 						<key>PATH</key>
+						<string>/Users/Jonathan/Developer/AquaProxy/Package/Modern Roots/USERTrust ECC Certification Authority.crt</string>
+						<key>PATH_TYPE</key>
+						<integer>0</integer>
+						<key>PERMISSIONS</key>
+						<integer>420</integer>
+						<key>TYPE</key>
+						<integer>3</integer>
+						<key>UID</key>
+						<integer>0</integer>
+					</dict>
+					<dict>
+						<key>CHILDREN</key>
+						<array/>
+						<key>GID</key>
+						<integer>0</integer>
+						<key>PATH</key>
 						<string>Modern Roots/USERTrust RSA Certification Authority.crt</string>
 						<key>PATH_TYPE</key>
 						<integer>1</integer>
@@ -1708,7 +1708,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2025.07.01</string>
+				<string>2025.03.30</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1780,6 +1780,7 @@
 
 • ISRG Root X1
 • USERTrust RSA Certification Authority
+• USERTrust ECC Certification Authority
 • DigiCert Global Root G2• DigiCert Global Root G3
 • COMODO ECC Certification Authority
 
@@ -1795,8 +1796,6 @@ These certificates are frequently needed on the modern web. If you don't know wh
 								</dict>
 								<key>PACKAGE_UUID</key>
 								<string>AF0C09D6-89B2-4302-8413-35B202727F41</string>
-								<key>REQUIREMENTS</key>
-								<array/>
 								<key>TITLE</key>
 								<array/>
 								<key>TYPE</key>
@@ -2007,7 +2006,7 @@ These certificates are frequently needed on the modern web. If you don't know wh
 						<key>IC_REQUIREMENT_OS_DISTRIBUTION_TYPE</key>
 						<integer>0</integer>
 						<key>IC_REQUIREMENT_OS_MAXIMUM_VERSION</key>
-						<integer>101106</integer>
+						<integer>101000</integer>
 						<key>IC_REQUIREMENT_OS_MINIMUM_VERSION</key>
 						<integer>100600</integer>
 					</dict>
@@ -2021,7 +2020,7 @@ These certificates are frequently needed on the modern web. If you don't know wh
 							<key>LANGUAGE</key>
 							<string>English</string>
 							<key>VALUE</key>
-							<string>Aqua Proxy supports Mac OS X 10.6 Snow Leopard – Mac OS X 10.11 El Capitan.</string>
+							<string>Aqua Proxy supports Mac OS X 10.6 Snow Leopard – Mac OS X 10.9 Mavericks.</string>
 						</dict>
 					</array>
 					<key>NAME</key>
