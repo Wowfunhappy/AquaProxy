@@ -14,8 +14,9 @@ To build:
  	sslPolicy := macOS.SecPolicyCreateSSL(opts.DNSName)
 -	macOS.CFArrayAppendValue(policies, sslPolicy)
 +	defer macOS.CFRelease(sslPolicy)
-+	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, sslPolicy)
+
 -	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, policies)
++	trustObj, err := macOS.SecTrustCreateWithCertificates(certs, sslPolicy)
 ```
 
 3. Build normally with `go build`.
