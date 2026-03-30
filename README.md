@@ -20,7 +20,5 @@ To build:
 ```
 
 3. Build normally with `go build`.
-4. Build [MacPorts Legacy Support](https://github.com/macports/macports-legacy-support/blob/master/BUILDING.txt) on Snow Leopard.
-5. Build [wowfunhappy-legacy-support](https://github.com/Wowfunhappy/wowfunhappy-legacy-support) (contains fixes from https://trac.macports.org/ticket/66749#comment:2).
-6. Place these dylibs in `Package/Aqua\ Proxy/AquaProxy`
-7. Run `insert_dylib.sh` to inject the libraries.
+4. Place these dylibs in `Package/Aqua\ Proxy/AquaProxy`
+5. Run `insert_dylib.sh` to inject needed [compatibility](https://github.com/macports/macports-legacy-support/blob/master/BUILDING.txt) [libraries](https://trac.macports.org/ticket/66749#comment:2).
