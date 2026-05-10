@@ -11,7 +11,7 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Library/AquaProxy/AquaProxy</string>
+		<string>/Library/AquaProxy/aquaproxy</string>
 	</array>
 
 	<key>StandardOutPath</key>
