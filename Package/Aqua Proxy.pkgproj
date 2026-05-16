@@ -1655,11 +1655,11 @@
 						<key>GID</key>
 						<integer>0</integer>
 						<key>PATH</key>
-						<string>/Users/Jonathan/Developer/AquaProxy/Package/Modern Roots/USERTrust ECC Certification Authority.crt</string>
+						<string>Modern Roots/USERTrust ECC Certification Authority.crt</string>
 						<key>PATH_TYPE</key>
-						<integer>0</integer>
+						<integer>1</integer>
 						<key>PERMISSIONS</key>
-						<integer>420</integer>
+						<integer>493</integer>
 						<key>TYPE</key>
 						<integer>3</integer>
 						<key>UID</key>
@@ -2006,7 +2006,7 @@ These certificates are frequently needed on the modern web. If you don't know wh
 						<key>IC_REQUIREMENT_OS_DISTRIBUTION_TYPE</key>
 						<integer>0</integer>
 						<key>IC_REQUIREMENT_OS_MAXIMUM_VERSION</key>
-						<integer>101000</integer>
+						<integer>101005</integer>
 						<key>IC_REQUIREMENT_OS_MINIMUM_VERSION</key>
 						<integer>100600</integer>
 					</dict>
