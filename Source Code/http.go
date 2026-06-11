@@ -1322,7 +1322,20 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, h
 					}
 					targetConfig.ServerName = targetURL.Host
 
-					targetConn, err := tls.Dial("tcp", targetURL.Host+":443", targetConfig)
+					var targetConn net.Conn
+					hostname := targetURL.Hostname()
+					port := targetURL.Port()
+					if (strings.HasSuffix(targetURL.Scheme, "s")) {
+						if port == "" {
+							port = "443"
+						}
+						targetConn, err = tls.Dial("tcp", hostname+":"+port, targetConfig)
+					} else {
+						if port == "" {
+							port = "80"
+						}
+						targetConn, err = net.Dial("tcp", hostname+":"+port)
+					}
 					if err != nil {
 						// Send error response to client
 						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
