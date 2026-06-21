@@ -1263,7 +1263,7 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 }
 
 // handleMITMWithLogging handles MITM connections with HTTP parsing and URL logging/redirects
-func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn *tls.Conn, host, connID string, checkRedirects bool) {
+func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn net.Conn, host, connID string, checkRedirects bool) {
 	// Read HTTP requests from client and forward to server
 	reader := bufio.NewReader(tlsConn)
 	serverReader := bufio.NewReader(serverConn)
@@ -1504,7 +1504,8 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	cConfig.ServerName = name
 
 	// Connect to the real server
-	serverConn, err := tls.Dial("tcp", host, cConfig)
+	var serverConn net.Conn
+	serverConn, err = tls.Dial("tcp", host, cConfig)
 	if err != nil {
 		// Check if there are redirects for this domain
 		domain := host
@@ -1526,15 +1527,23 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 					targetHost = targetHost + ":443"
 				}
 
-				// Update TLS config for new host
-				redirectConfig := new(tls.Config)
-				*redirectConfig = *cConfig
-				redirectConfig.ServerName = rules[0].toURL.Host
-
 				// Try connecting to redirect target
-				redirectConn, redirectErr := tls.Dial("tcp", targetHost, redirectConfig)
+				var redirectConn net.Conn
+				var redirectErr error
+				if rules[0].toURL.Scheme == "https" {
+					// Update TLS config for new host
+					redirectConfig := new(tls.Config)
+					*redirectConfig = *cConfig
+					redirectConfig.ServerName = rules[0].toURL.Host
+
+					redirectConn, redirectErr = tls.Dial("tcp", targetHost, redirectConfig)
+				} else {
+					redirectConn, redirectErr = net.Dial("tcp", targetHost)
+				}
+
 				if redirectErr == nil {
 					// Success! Use this connection
+					host = targetHost
 					serverConn = redirectConn
 					err = nil
 				}
