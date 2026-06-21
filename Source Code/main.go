@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -45,6 +46,7 @@ var (
 	imapPort    = flag.Int("imap-port", 6532, "IMAP proxy port")
 	smtpPort    = flag.Int("smtp-port", 6533, "SMTP proxy port")
 	debug       = flag.Bool("debug", false, "Enable debug logging (ignored by HTTP proxy)")
+	disableHTTP = flag.Bool("no-http", false, "Disable HTTP proxy")
 	disableIMAP = flag.Bool("no-imap", false, "Disable IMAP proxy")
 	disableSMTP = flag.Bool("no-smtp", false, "Disable SMTP proxy")
 
@@ -64,8 +66,22 @@ var (
 )
 
 func main() {
+	// Read flags from flags.txt if it exists
+	if data, err := ioutil.ReadFile("flags.txt"); err == nil {
+		flags := strings.Fields(string(data))
+		os.Args = append([]string{os.Args[0]}, append(flags, os.Args[1:]...)...)
+	}
+
+	flag.Parse()
+
+	if *disableHTTP && *disableIMAP && *disableSMTP {
+		log.Fatal("All proxies are disabled, nothing to do")
+	}
+
 	IMAPMain()
-	HTTPMain()
+	if !*disableHTTP {
+		HTTPMain()
+	}
 }
 
 func isSnowLeopard() bool {

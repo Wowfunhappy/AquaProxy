@@ -5,13 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -52,14 +49,6 @@ type MailConnection struct {
 }
 
 func IMAPMain() {
-	// Read flags from flags.txt if it exists
-	if data, err := ioutil.ReadFile("flags.txt"); err == nil {
-		flags := strings.Fields(string(data))
-		os.Args = append([]string{os.Args[0]}, append(flags, os.Args[1:]...)...)
-	}
-
-	flag.Parse()
-
 	// Create TLS config for upstream connections
 	systemRoots, err := loadSystemCertPool()
 	if err != nil {
@@ -102,10 +91,6 @@ func IMAPMain() {
 		if err := smtpProxy.Start(); err != nil {
 			log.Fatal("Failed to start SMTP proxy:", err)
 		}
-	}
-
-	if *disableIMAP && *disableSMTP {
-		log.Fatal("Both IMAP and SMTP are disabled, nothing to do")
 	}
 
 	// Print single startup message
