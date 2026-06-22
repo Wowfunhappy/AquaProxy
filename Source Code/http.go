@@ -1450,6 +1450,7 @@ func (l *singleUseListener) Addr() net.Addr {
 
 // serveMITM handles a connection in MITM mode with TLS interception
 func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *clientHelloInfo, connID string) {
+	orighost := host
 	// Get certificate from cache or generate new one
 	cert, err := p.cert(name)
 	if err != nil {
@@ -1580,8 +1581,8 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 
 	// Check if domain has redirect or header rules
 	// Extract domain without port
-	domain := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
+	domain := orighost
+	if h, _, err := net.SplitHostPort(orighost); err == nil {
 		domain = h
 	}
 
