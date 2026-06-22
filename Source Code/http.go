@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -746,6 +745,8 @@ func HTTPMain() {
 		FlushInterval:   100 * time.Millisecond,
 		Wrap:            transparentProxy,
 	}
+	// Set after p exists; the transport's TLS dialer is a method on p.
+	p.upstreamTransport = p.newUpstreamTransport()
 
 	log.Printf("Aqua HTTP Proxy started on port %d", *httpPort)
 	if *logURLs {
@@ -990,6 +991,48 @@ type Proxy struct {
 	// response body.
 	// If zero, no periodic flushing is done.
 	FlushInterval time.Duration
+
+	// upstreamTransport is the single shared transport used to dial upstreams for
+	// both the plain-HTTP and MITM paths. One pooled transport — the way a
+	// browser keeps a single connection pool — reuses and bounds upstream
+	// connections, rather than opening (and leaking) one per request or per
+	// client connection.
+	upstreamTransport *http.Transport
+}
+
+// newUpstreamTransport builds the shared upstream transport. Plain (http)
+// targets use the transport's default dialer. TLS (https) targets are dialed
+// through dialUpstream so the modern-TLS bridge and certificate-chain
+// diagnostics are preserved; setting DialTLS also keeps upstream connections on
+// HTTP/1.1 and means the transport's own TLSClientConfig is never consulted, so
+// it is deliberately omitted (dialUpstream applies p.TLSClientConfig itself).
+// Redirect resolution lives entirely in the directors, which rewrite the request
+// URL before it reaches the dialer; the dialer just dials what it is told, so a
+// dead origin on a non-redirected path surfaces as a 502 rather than being
+// silently sent to a guessed redirect target. Idle connections are pooled and
+// expire (a hand-built Transport otherwise keeps them forever, since
+// IdleConnTimeout defaults to 0).
+func (p *Proxy) newUpstreamTransport() *http.Transport {
+	return &http.Transport{
+		DialTLS: func(network, addr string) (net.Conn, error) {
+			host := addr
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				host = h
+			}
+			return p.dialUpstream(addr, true, host, "upstream")
+		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+	}
+}
+
+// roundTripper returns the RoundTripper both proxy paths hand to
+// httputil.ReverseProxy: the shared upstream pool wrapped to drop the
+// X-Forwarded-For header ReverseProxy adds, so the proxy stays transparent on
+// the plain-HTTP and MITM paths alike.
+func (p *Proxy) roundTripper() http.RoundTripper {
+	return transparentTransport{base: p.upstreamTransport}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1030,42 +1073,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Create a custom transport that handles connection errors
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// First try to connect to the requested address
-			conn, err := net.Dial(network, addr)
-			if err != nil {
-				// If connection fails, check if this is a redirect domain
-				host, _, _ := net.SplitHostPort(addr)
-				redirectMutex.RLock()
-				rules, hasRedirects := redirectRules[host]
-				redirectMutex.RUnlock()
-
-				if hasRedirects && len(rules) > 0 {
-					// Try the first redirect target
-					targetHost := rules[0].toURL.Host
-					targetPort := rules[0].toURL.Port()
-					if targetPort == "" {
-						if rules[0].toURL.Scheme == "https" {
-							targetPort = "443"
-						} else {
-							targetPort = "80"
-						}
-					}
-					targetAddr := net.JoinHostPort(targetHost, targetPort)
-
-					return net.Dial(network, targetAddr)
-				}
-			}
-			return conn, err
-		},
-		TLSClientConfig: p.TLSClientConfig,
-	}
-
 	rp := &httputil.ReverseProxy{
 		Director:      director,
-		Transport:     transport,
+		Transport:     p.roundTripper(),
 		FlushInterval: p.FlushInterval,
 	}
 	p.Wrap(rp).ServeHTTP(w, r)
@@ -1262,13 +1272,6 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	serverConn.Close()
 }
 
-// upstreamConn is a cached connection to a single upstream target, paired with
-// its buffered reader so responses can be read across keep-alive requests.
-type upstreamConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-}
-
 // dialUpstream opens a connection to addr. When isTLS is set it performs a TLS
 // handshake using serverName; on a certificate-authority failure it retries
 // once with verification disabled, solely to log the offending chain.
@@ -1297,204 +1300,150 @@ func (p *Proxy) dialUpstream(addr string, isTLS bool, serverName, connID string)
 		if retryConn, retryErr := tls.Dial("tcp", addr, retryConfig); retryErr == nil {
 			capturedChain := retryConn.ConnectionState().PeerCertificates
 			retryConn.Close()
-			log.Printf("[%s] Failed to connect to upstream host: %v%s", connID, err, extractCertificateChainInfo(err, capturedChain))
+			log.Printf("[%s] Failed to connect to upstream %s: %v%s", connID, addr, err, extractCertificateChainInfo(err, capturedChain))
 			return nil, err
 		}
 	}
-	log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+	log.Printf("[%s] Failed to connect to upstream %s: %v", connID, addr, err)
 	return nil, err
 }
 
-// upstreamTarget derives the dial address, TLS flag, and SNI server name for a
-// request URL, supplying the default port for the scheme when none is given.
-func upstreamTarget(u *url.URL) (addr string, isTLS bool, serverName string) {
-	hostname := u.Hostname()
-	port := u.Port()
-	isTLS = u.Scheme != "http" // https (and CONNECT-originated requests) use TLS
-	if port == "" {
-		if isTLS {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-	return net.JoinHostPort(hostname, port), isTLS, hostname
+// serverErrorLog silences the internal error logging of the per-connection
+// http.Server and ReverseProxy; meaningful upstream-dial failures are already
+// reported by dialUpstream.
+var serverErrorLog = log.New(ioutil.Discard, "", 0)
+
+// mitmIdleTimeout bounds how long an intercepted keep-alive connection may sit
+// idle between requests before the proxy closes it.
+var mitmIdleTimeout = 60 * time.Second
+
+// tlsHandshakeTimeout bounds the client-facing TLS handshake so connections that
+// open but never finish handshaking (e.g. speculative pre-connects) can't pile up
+const tlsHandshakeTimeout = 30 * time.Second
+
+// transparentTransport strips the X-Forwarded-For header that ReverseProxy adds
+// before each request is sent upstream, to avoid revealing the request came through
+// a proxy. In theory, servers shouldn't care if a proxy is in use, but they may, and
+// it's really none of their business.
+type transparentTransport struct{ base http.RoundTripper }
+
+func (t transparentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Del("X-Forwarded-For")
+	return t.base.RoundTrip(req)
 }
 
-// handleMITMWithLogging parses each HTTP request from an intercepted TLS
-// connection, applies header/redirect rules, and forwards it to the appropriate
-// upstream. The upstream connection is dialed lazily once the real target is
-// known (which, for redirects, depends on the full request URL) and cached per
-// target so keep-alive requests reuse the same socket instead of redialing.
-func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, defaultHost, connID string, checkRedirects bool) {
-	reader := bufio.NewReader(tlsConn)
-
-	// Upstream connections keyed by "scheme://host:port" so repeated requests to
-	// the same target (including redirect targets) reuse one connection.
-	conns := make(map[string]*upstreamConn)
-	defer func() {
-		for _, uc := range conns {
-			uc.conn.Close()
-		}
-		tlsConn.Close()
-	}()
-
-	for {
-		// Read the request
-		req, err := http.ReadRequest(reader)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[%s] Error reading request: %v", connID, err)
-			}
-			return
-		}
-
-		// Set up the request URL
+// handleMITMWithProxy serves an intercepted, TLS-terminated connection through
+// Go's HTTP engine. An httputil.ReverseProxy handles the decrypted requests and
+// re-originates each one to the real server over a modern TLS connection.
+func (p *Proxy) handleMITMWithProxy(tlsConn net.Conn, defaultHost, connID string, checkRedirects bool) {
+	director := func(req *http.Request) {
+		// The intercepted request carries only an origin-form target, so rebuild
+		// the absolute HTTPS URL it was really for.
 		req.URL.Scheme = "https"
 		if req.Host == "" {
 			req.Host = defaultHost
 		}
 		req.URL.Host = req.Host
 
-		// Log the URL if enabled
 		if *logURLs {
-			fullURL := fmt.Sprintf("https://%s%s", req.Host, req.URL.Path)
-			if req.URL.RawQuery != "" {
-				fullURL += "?" + req.URL.RawQuery
-			}
-			log.Printf("[%s] MITM URL: %s %s", connID, req.Method, fullURL)
+			log.Printf("[%s] MITM URL: %s https://%s%s", connID, req.Method, req.Host, req.URL.RequestURI())
 		}
 
-		// Apply custom headers if any match (check against original URL before redirect)
+		// Apply header rules matching the original URL, then any redirect, then
+		// header rules matching the redirect target.
 		if headers, ok := checkHeaders(req.URL); ok {
 			applyHeaders(req, headers)
 		}
-
-		// Check for redirects if enabled for this domain. The target host is not
-		// known until the full request URL is parsed, which is why the upstream
-		// connection is only resolved (and dialed) after this point.
 		if checkRedirects {
 			if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
 				log.Printf("[%s] Redirecting %s → %s", connID, req.URL.String(), targetURL.String())
-
-				// Update request to point to new URL
 				req.URL = targetURL
 				req.Host = targetURL.Host
-
-				// Check for custom headers matching the redirect target
 				if headers, ok := checkHeaders(req.URL); ok {
 					applyHeaders(req, headers)
 				}
 			}
 		}
-
-		// Resolve the upstream target for this (possibly redirected) request.
-		addr, isTLS, serverName := upstreamTarget(req.URL)
-		key := req.URL.Scheme + "://" + addr
-
-		// RequestURI must be cleared before writing an outgoing client request.
-		req.RequestURI = ""
-
-		// Forward to the target, reusing a cached connection when possible.
-		resp, err := p.forwardRequest(req, conns, key, addr, isTLS, serverName, connID)
-		if err != nil {
-			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-			return
-		}
-
-		// Write response back to client
-		err = resp.Write(tlsConn)
-		if err != nil {
-			log.Printf("[%s] Error writing response to client: %v", connID, err)
-			resp.Body.Close()
-			return
-		}
-		resp.Body.Close()
-
-		// Check if connection should be closed
-		if req.Close || resp.Close {
-			return
-		}
 	}
+
+	rp := &httputil.ReverseProxy{
+		Director: director,
+		// The shared upstream pool reuses connections across client connections
+		// and expires idle ones, so there is nothing to clean up per connection.
+		Transport:     p.roundTripper(),
+		FlushInterval: p.FlushInterval,
+		ErrorLog:      serverErrorLog,
+	}
+
+	// Serve the single connection. http.Server drives request parsing, keep-alive,
+	// and upgrade hijacking; Serve returns once the connection is closed. The
+	// timeouts ensure idle or half-open connections are reclaimed instead of being
+	// held open forever (which would leak file descriptors).
+	server := &http.Server{
+		Handler:           rp,
+		ErrorLog:          serverErrorLog,
+		IdleTimeout:       mitmIdleTimeout,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+	server.Serve(newSingleUseListener(tlsConn))
 }
 
-// forwardRequest sends req to the upstream identified by key/addr, dialing and
-// caching the connection on first use. If a reused (cached) connection fails
-// before any response is received and the request is safe to repeat, it redials
-// once on a fresh connection to recover from a stale keep-alive socket.
-func (p *Proxy) forwardRequest(req *http.Request, conns map[string]*upstreamConn, key, addr string, isTLS bool, serverName, connID string) (*http.Response, error) {
-	// Only bodyless, idempotent requests may be safely re-sent on a fresh socket.
-	canRetry := req.ContentLength == 0 &&
-		(req.Method == "GET" || req.Method == "HEAD" || req.Method == "OPTIONS" || req.Method == "TRACE")
-
-	for attempt := 0; attempt < 2; attempt++ {
-		uc := conns[key]
-		reused := uc != nil
-		if uc == nil {
-			conn, err := p.dialUpstream(addr, isTLS, serverName, connID)
-			if err != nil {
-				return nil, err
-			}
-			uc = &upstreamConn{conn: conn, reader: bufio.NewReader(conn)}
-			conns[key] = uc
-		}
-
-		if err := req.Write(uc.conn); err != nil {
-			uc.conn.Close()
-			delete(conns, key)
-			if reused && canRetry {
-				continue // stale keep-alive connection; retry on a fresh one
-			}
-			log.Printf("[%s] Error writing request to upstream %s: %v", connID, addr, err)
-			return nil, err
-		}
-
-		resp, err := http.ReadResponse(uc.reader, req)
-		if err != nil {
-			uc.conn.Close()
-			delete(conns, key)
-			if reused && canRetry {
-				continue
-			}
-			log.Printf("[%s] Error reading response from upstream %s: %v", connID, addr, err)
-			return nil, err
-		}
-		return resp, nil
-	}
-	return nil, fmt.Errorf("upstream %s unreachable", addr)
-}
-
-// singleUseListener implements net.Listener for a single connection
+// singleUseListener adapts a single, already-accepted connection to the
+// net.Listener interface so an http.Server can serve it. Accept yields the
+// connection once; subsequent calls block until the connection is closed, so
+// http.Server.Serve returns only after the connection is finished.
 type singleUseListener struct {
-	conn   net.Conn
-	closed chan struct{}
-	once   sync.Once
+	conn net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func newSingleUseListener(conn net.Conn) *singleUseListener {
+	l := &singleUseListener{done: make(chan struct{})}
+	// Wrap the connection so that when the server closes it, Accept unblocks and
+	// Serve unwinds.
+	l.conn = &closeNotifyConn{Conn: conn, notify: l.shutdown}
+	return l
+}
+
+func (l *singleUseListener) shutdown() {
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
 }
 
 func (l *singleUseListener) Accept() (net.Conn, error) {
-	select {
-	case <-l.closed:
-		return nil, io.EOF
-	default:
-		l.once.Do(func() {
-			close(l.closed)
-		})
-		return l.conn, nil
+	var c net.Conn
+	l.once.Do(func() { c = l.conn })
+	if c != nil {
+		return c, nil
 	}
+	<-l.done
+	return nil, io.EOF
 }
 
 func (l *singleUseListener) Close() error {
-	select {
-	case <-l.closed:
-		return nil
-	default:
-		close(l.closed)
-		return nil
-	}
+	l.shutdown()
+	return nil
 }
 
 func (l *singleUseListener) Addr() net.Addr {
 	return l.conn.LocalAddr()
+}
+
+// closeNotifyConn invokes notify the first time the connection is closed, which
+// lets the owning singleUseListener release http.Server.Serve.
+type closeNotifyConn struct {
+	net.Conn
+	once   sync.Once
+	notify func()
+}
+
+func (c *closeNotifyConn) Close() error {
+	c.once.Do(c.notify)
+	return c.Conn.Close()
 }
 
 // serveMITM handles a connection in MITM mode with TLS interception
@@ -1539,12 +1488,15 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	}
 
 	// Perform TLS handshake
+	tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
 	err = tlsConn.Handshake()
 	if err != nil {
 		//log.Printf("[%s] TLS handshake error: %v", connID, err)
 		tlsConn.Close()
 		return
 	}
+	// Clear the handshake deadline; http.Server applies its own idle/read timeouts.
+	tlsConn.SetDeadline(time.Time{})
 
 	// Determine whether this connection needs HTTP-level handling (URL logging,
 	// header rewriting, or redirects). Rule lookups use the original host.
@@ -1559,12 +1511,12 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 
 	hasHeaders := hasHeaderRules(domain)
 
-	// If URL logging is enabled OR the domain has redirect/header rules, parse
-	// HTTP requests. The upstream connection is dialed lazily inside the handler
-	// once the real target is known, so a request whose redirect points at a
-	// live host still succeeds even when the original host is down.
+	// If URL logging is enabled OR the domain has redirect/header rules, hand the
+	// decrypted connection to Go's HTTP engine, which resolves the real target
+	// per request (so a redirect to a live host still works when the original
+	// host is down) and handles the full range of HTTP behavior.
 	if *logURLs || hasRedirects || hasHeaders {
-		p.handleMITMWithLogging(tlsConn, orighost, connID, hasRedirects)
+		p.handleMITMWithProxy(tlsConn, orighost, connID, hasRedirects)
 		return
 	}
 

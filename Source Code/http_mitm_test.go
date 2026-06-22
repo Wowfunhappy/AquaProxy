@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -30,32 +31,6 @@ func TestMain(m *testing.M) {
 
 // --- unit tests for the pure helpers -------------------------------------
 
-func TestUpstreamTarget(t *testing.T) {
-	cases := []struct {
-		in       string
-		wantAddr string
-		wantTLS  bool
-		wantSNI  string
-	}{
-		{"https://example.com", "example.com:443", true, "example.com"},
-		{"https://example.com:443", "example.com:443", true, "example.com"},
-		{"https://example.com:8443", "example.com:8443", true, "example.com"},
-		{"http://example.com", "example.com:80", false, "example.com"},
-		{"http://example.com:8080", "example.com:8080", false, "example.com"},
-	}
-	for _, c := range cases {
-		u, err := url.Parse(c.in)
-		if err != nil {
-			t.Fatalf("parse %q: %v", c.in, err)
-		}
-		addr, isTLS, sni := upstreamTarget(u)
-		if addr != c.wantAddr || isTLS != c.wantTLS || sni != c.wantSNI {
-			t.Errorf("upstreamTarget(%q) = (%q, %v, %q); want (%q, %v, %q)",
-				c.in, addr, isTLS, sni, c.wantAddr, c.wantTLS, c.wantSNI)
-		}
-	}
-}
-
 // two rules for the same host must each be selected by the request path, not by being first
 // in the list.
 func TestCheckRedirectSelectsRuleByPath(t *testing.T) {
@@ -74,7 +49,7 @@ func TestCheckRedirectSelectsRuleByPath(t *testing.T) {
 	}
 }
 
-// --- integration tests for handleMITMWithLogging -------------------------
+// --- integration tests for handleMITMWithProxy ---------------------------
 
 // TestMITMRoutesEachRequestToCorrectRedirectTarget proves the handler resolves
 // the redirect target per request rather than committing to one target for the
@@ -232,10 +207,15 @@ func bodyHandler(body string) http.HandlerFunc {
 	}
 }
 
-// startMITM runs handleMITMWithLogging against an accepted TLS connection and
+// startMITM runs handleMITMWithProxy against an accepted TLS connection and
 // returns the client end of that TLS connection plus a cleanup function.
 func startMITM(t *testing.T, p *Proxy, defaultHost string, checkRedirects bool) (*tls.Conn, func()) {
 	t.Helper()
+	// In production the constructor sets this; tests build a bare Proxy, so give
+	// it the shared upstream transport handleMITMWithProxy relies on.
+	if p.upstreamTransport == nil {
+		p.upstreamTransport = p.newUpstreamTransport()
+	}
 	cert := selfSignedCert(t)
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
 	if err != nil {
@@ -246,7 +226,7 @@ func startMITM(t *testing.T, p *Proxy, defaultHost string, checkRedirects bool) 
 		if err != nil {
 			return
 		}
-		p.handleMITMWithLogging(conn.(*tls.Conn), defaultHost, "test", checkRedirects)
+		p.handleMITMWithProxy(conn, defaultHost, "test", checkRedirects)
 	}()
 
 	client, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true})
@@ -313,6 +293,304 @@ func oneShotUpstream(t *testing.T, body string) (addr string, count *int64, stop
 		}
 	}()
 	return ln.Addr().String(), &n, func() { ln.Close() }
+}
+
+// wsEchoUpstream accepts one connection, reads the HTTP upgrade request,
+// replies with 101 Switching Protocols, then echoes everything that follows —
+// simulating a WebSocket server after the handshake.
+func wsEchoUpstream(t *testing.T) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		br := bufio.NewReader(conn)
+		if _, err := http.ReadRequest(br); err != nil {
+			conn.Close()
+			return
+		}
+		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		io.Copy(conn, br) // echo post-handshake bytes back to the client
+		conn.Close()
+	}()
+	return ln.Addr().String(), func() { ln.Close() }
+}
+
+// TestMITMTunnelsWebSocketUpgrade proves a 101 Switching Protocols response
+// flips the connection into a raw bidirectional tunnel instead of the proxy
+// trying to parse the next bytes as HTTP. Like a real WebSocket client, the
+// test waits for the 101 before sending a frame, then expects it echoed back.
+func TestMITMTunnelsWebSocketUpgrade(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	addr, stop := wsEchoUpstream(t)
+	defer stop()
+	addRedirectRule("https://foo.com/ws", "http://"+addr+"/ws")
+
+	client, cleanup := startMITM(t, &Proxy{}, "foo.com:443", true)
+	defer cleanup()
+	br := bufio.NewReader(client)
+
+	upgrade := "GET /ws HTTP/1.1\r\nHost: foo.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+	if _, err := client.Write([]byte(upgrade)); err != nil {
+		t.Fatalf("write upgrade: %v", err)
+	}
+
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read upgrade response: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("got status %d; want 101 Switching Protocols", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Upgrade"); got != "websocket" {
+		t.Errorf("Upgrade header = %q; want websocket", got)
+	}
+
+	// The connection is now a raw tunnel: send a frame and expect it echoed.
+	payload := "hello-ws"
+	if _, err := client.Write([]byte(payload)); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	echoed := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, echoed); err != nil {
+		t.Fatalf("read tunneled bytes: %v", err)
+	}
+	if string(echoed) != payload {
+		t.Errorf("tunneled bytes = %q; want %q (bidirectional tunnel failed)", echoed, payload)
+	}
+}
+
+// TestMITMHandlesExpect100Continue proves a client withholding its body behind
+// Expect: 100-continue gets a 100 from the proxy, then its body is forwarded
+// and the final response relayed — without deadlocking.
+func TestMITMHandlesExpect100Continue(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := ioutil.ReadAll(r.Body)
+		io.WriteString(w, "got:"+string(body))
+	}))
+	defer ts.Close()
+	addRedirectRule("https://foo.com/submit", ts.URL+"/submit")
+
+	client, cleanup := startMITM(t, &Proxy{}, "foo.com:443", true)
+	defer cleanup()
+	br := bufio.NewReader(client)
+
+	// Send headers only, then wait for the proxy's 100 before sending the body.
+	headers := "POST /submit HTTP/1.1\r\nHost: foo.com\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+	if _, err := client.Write([]byte(headers)); err != nil {
+		t.Fatalf("write headers: %v", err)
+	}
+
+	interim, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read interim response: %v", err)
+	}
+	if interim.StatusCode != http.StatusContinue {
+		t.Fatalf("got status %d; want 100 Continue", interim.StatusCode)
+	}
+	interim.Body.Close()
+
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+
+	final, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read final response: %v", err)
+	}
+	body, _ := ioutil.ReadAll(final.Body)
+	final.Body.Close()
+	if final.StatusCode != 200 || string(body) != "got:hello" {
+		t.Fatalf("got %d %q; want 200 got:hello", final.StatusCode, body)
+	}
+}
+
+// TestMITMOmitsXForwardedFor proves the proxy stays transparent and does not
+// add an X-Forwarded-For header to forwarded requests.
+func TestMITMOmitsXForwardedFor(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	gotXFF := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF <- r.Header.Get("X-Forwarded-For")
+		io.WriteString(w, "ok")
+	}))
+	defer ts.Close()
+	addRedirectRule("https://foo.com/", ts.URL+"/")
+
+	client, cleanup := startMITM(t, &Proxy{}, "foo.com:443", true)
+	defer cleanup()
+	br := bufio.NewReader(client)
+
+	if resp, body := sendGet(t, client, br, "/thing", "foo.com"); resp.StatusCode != 200 || body != "ok" {
+		t.Fatalf("got %d %q; want 200 ok", resp.StatusCode, body)
+	}
+	if xff := <-gotXFF; xff != "" {
+		t.Errorf("upstream saw X-Forwarded-For %q; want it absent", xff)
+	}
+}
+
+// TestMITMBoundsUpstreamPool proves the shared upstream pool reuses connections
+// across many separate client connections and stays bounded, rather than
+// opening (and leaking) a new upstream connection per client connection.
+func TestMITMBoundsUpstreamPool(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	var open int64
+	ts := httptest.NewUnstartedServer(bodyHandler("ok"))
+	ts.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		switch s {
+		case http.StateNew:
+			atomic.AddInt64(&open, 1)
+		case http.StateClosed:
+			atomic.AddInt64(&open, -1)
+		}
+	}
+	ts.Start()
+	defer ts.Close()
+	addRedirectRule("https://foo.com/", ts.URL+"/")
+
+	// One Proxy → one shared upstream pool reused across all client connections.
+	p := &Proxy{}
+
+	for i := 0; i < 25; i++ {
+		client, cleanup := startMITM(t, p, "foo.com:443", true)
+		br := bufio.NewReader(client)
+		if resp, body := sendGet(t, client, br, "/x", "foo.com"); resp.StatusCode != 200 || body != "ok" {
+			t.Fatalf("cycle %d: got %d %q; want 200 ok", i, resp.StatusCode, body)
+		}
+		cleanup()
+	}
+
+	if n := atomic.LoadInt64(&open); n > 4 {
+		t.Errorf("upstream pool holds %d connections after 25 client connections; want bounded reuse (≤4)", n)
+	}
+}
+
+// TestMITMClosesIdleClientConnection proves an idle keep-alive connection is
+// closed by the proxy after the idle timeout, so connections a client opens and
+// then abandons (without closing) don't accumulate and exhaust file descriptors.
+func TestMITMClosesIdleClientConnection(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	old := mitmIdleTimeout
+	mitmIdleTimeout = 150 * time.Millisecond
+	defer func() { mitmIdleTimeout = old }()
+
+	ts := httptest.NewServer(bodyHandler("ok"))
+	defer ts.Close()
+	addRedirectRule("https://foo.com/", ts.URL+"/")
+
+	client, cleanup := startMITM(t, &Proxy{}, "foo.com:443", true)
+	defer cleanup()
+	br := bufio.NewReader(client)
+
+	// One request to establish a keep-alive connection.
+	if resp, body := sendGet(t, client, br, "/x", "foo.com"); resp.StatusCode != 200 || body != "ok" {
+		t.Fatalf("got %d %q; want 200 ok", resp.StatusCode, body)
+	}
+
+	// Leave the connection idle; the proxy should close it after the timeout, so
+	// a read returns EOF rather than blocking until our own deadline.
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err := br.ReadByte()
+	if err == nil {
+		t.Fatal("expected idle connection to be closed by the proxy")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("idle connection still open 2s after a 150ms idle timeout")
+	}
+}
+
+// TestPlainHTTPReusesUpstreamConnection proves the non-MITM (plain HTTP) path
+// reuses a pooled upstream connection across requests instead of opening — and
+// leaking — a new one per request. This is the path OCSP checks flow through;
+// the per-request transport it used to create leaked a connection each time.
+func TestPlainHTTPReusesUpstreamConnection(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	var conns int64
+	ts := httptest.NewUnstartedServer(bodyHandler("ok"))
+	ts.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			atomic.AddInt64(&conns, 1)
+		}
+	}
+	ts.Start()
+	defer ts.Close()
+
+	p := &Proxy{Wrap: func(h http.Handler) http.Handler { return h }}
+	p.upstreamTransport = p.newUpstreamTransport()
+
+	for i := 0; i < 12; i++ {
+		req := httptest.NewRequest("GET", ts.URL+"/x", nil)
+		req.RemoteAddr = "127.0.0.1:40000"
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+		if rec.Code != 200 || rec.Body.String() != "ok" {
+			t.Fatalf("request %d: got %d %q; want 200 ok", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	if got := atomic.LoadInt64(&conns); got > 2 {
+		t.Errorf("plain HTTP opened %d upstream connections for 12 requests; want pooled reuse (≤2)", got)
+	}
+}
+
+// interimContinueUpstream accepts one connection, reads the request, then sends
+// an interim 100 Continue immediately followed by a final 200, then closes —
+// simulating an upstream that emits an interim response of its own.
+func interimContinueUpstream(t *testing.T, body string) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		http.ReadRequest(bufio.NewReader(conn))
+		io.WriteString(conn, "HTTP/1.1 100 Continue\r\n\r\n")
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+		conn.Close()
+	}()
+	return ln.Addr().String(), func() { ln.Close() }
+}
+
+// TestMITMSkipsInterimContinueFromUpstream proves an interim 100 Continue sent
+// by the upstream is skipped, so the client sees only the final response.
+func TestMITMSkipsInterimContinueFromUpstream(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	addr, stop := interimContinueUpstream(t, "ok")
+	defer stop()
+	addRedirectRule("https://foo.com/", "http://"+addr+"/")
+
+	client, cleanup := startMITM(t, &Proxy{}, "foo.com:443", true)
+	defer cleanup()
+	br := bufio.NewReader(client)
+
+	resp, body := sendGet(t, client, br, "/thing", "foo.com")
+	if resp.StatusCode != 200 || body != "ok" {
+		t.Fatalf("got %d %q; want 200 ok (interim 100 not skipped)", resp.StatusCode, body)
+	}
 }
 
 func selfSignedCert(t *testing.T) tls.Certificate {
