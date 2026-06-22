@@ -23,8 +23,9 @@ var (
 	// Generated certs are only used between the OS and the proxy. Prioritize speed.
 	RSAKeyLength = 1024
 
-	// Cache for certificates fetched via AIA
-	aiaCertCache  = make(map[string]*x509.Certificate)
+	// Cache for certificates fetched via AIA (one URL may yield several certs,
+	// e.g. a PKCS#7 bundle containing a root and its cross-signed forms)
+	aiaCertCache  = make(map[string][]*x509.Certificate)
 	aiaCacheMutex sync.RWMutex
 
 	// Cache for generated leaf certificates

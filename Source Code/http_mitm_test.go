@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -614,4 +615,220 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 		t.Fatalf("create cert: %v", err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+}
+
+// makeCert creates a certificate from tmpl signed by parent/parentKey. Passing a
+// nil parentKey makes a self-signed certificate (a root).
+func makeCert(t *testing.T, tmpl, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	signer, signee := parentKey, parent
+	if signer == nil { // self-signed
+		signer, signee = key, tmpl
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, signee, &key.PublicKey, signer)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return cert, key
+}
+
+func resetAIACache() {
+	aiaCacheMutex.Lock()
+	aiaCertCache = make(map[string][]*x509.Certificate)
+	aiaCacheMutex.Unlock()
+}
+
+// TestDialUpstreamChasesAIA proves the proxy completes an incomplete certificate
+// chain by fetching the missing intermediate via the leaf's AIA URL — and still
+// rejects a certificate presented for the wrong hostname.
+func TestDialUpstreamChasesAIA(t *testing.T) {
+	caCert, caKey := makeCert(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test Root CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}, nil, nil)
+
+	interCert, interKey := makeCert(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "Test Intermediate CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}, caCert, caKey)
+
+	// Serve the intermediate at an AIA URL as a PKCS#7 (.p7c) bundle — the format
+	// real CAs such as Sectigo use, which is what broke chain completion.
+	p7c := makePKCS7CertsOnly(t, interCert)
+	aiaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(p7c)
+	}))
+	defer aiaSrv.Close()
+
+	leafCert, leafKey := makeCert(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(3),
+		Subject:               pkix.Name{CommonName: "example.test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		DNSNames:              []string{"example.test"},
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IssuingCertificateURL: []string{aiaSrv.URL},
+	}, interCert, interKey)
+
+	// TLS server presenting ONLY the leaf — an incomplete chain (no intermediate).
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{leafCert.Raw}, PrivateKey: leafKey}},
+	}
+	ts.StartTLS()
+	defer ts.Close()
+	u, _ := url.Parse(ts.URL)
+	addr := u.Host
+
+	roots := x509.NewCertPool()
+	roots.AddCert(caCert)
+	p := &Proxy{TLSClientConfig: &tls.Config{RootCAs: roots}}
+
+	// Correct hostname: the chain is incomplete, so success proves the proxy
+	// fetched the missing intermediate via AIA.
+	resetAIACache()
+	conn, err := p.dialUpstream(addr, true, "example.test", "test")
+	if err != nil {
+		t.Fatalf("dialUpstream should complete the chain via AIA chasing, got: %v", err)
+	}
+	conn.Close()
+
+	// Wrong hostname: must still be rejected — InsecureSkipVerify disabled Go's
+	// hostname check, so our verifier has to enforce it.
+	resetAIACache()
+	if conn, err := p.dialUpstream(addr, true, "wrong.test", "test"); err == nil {
+		conn.Close()
+		t.Errorf("dialUpstream accepted a certificate for the wrong hostname")
+	}
+}
+
+// makePKCS7CertsOnly builds a minimal PKCS#7 "certs-only" SignedData bundle
+// wrapping the given certificates — the format CAs serve at .p7c AIA URLs.
+func makePKCS7CertsOnly(t *testing.T, certs ...*x509.Certificate) []byte {
+	t.Helper()
+	var certBytes []byte
+	for _, c := range certs {
+		certBytes = append(certBytes, c.Raw...)
+	}
+	type contentInfo struct {
+		ContentType asn1.ObjectIdentifier
+	}
+	type signedData struct {
+		Version          int
+		DigestAlgorithms []asn1.RawValue `asn1:"set"`
+		ContentInfo      contentInfo
+		Certificates     asn1.RawValue
+		SignerInfos      []asn1.RawValue `asn1:"set"`
+	}
+	sd := signedData{
+		Version:          1,
+		DigestAlgorithms: []asn1.RawValue{},
+		ContentInfo:      contentInfo{ContentType: asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}}, // data
+		Certificates:     asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true, Bytes: certBytes},
+		SignerInfos:      []asn1.RawValue{},
+	}
+	type outer struct {
+		ContentType asn1.ObjectIdentifier
+		Content     signedData `asn1:"explicit,tag:0"`
+	}
+	der, err := asn1.Marshal(outer{ContentType: oidPKCS7SignedData, Content: sd})
+	if err != nil {
+		t.Fatalf("marshal PKCS#7: %v", err)
+	}
+	return der
+}
+
+// TestParseAIACerts checks that AIA responses are parsed whether they are a
+// single DER certificate or a PKCS#7 bundle of several certificates.
+func TestParseAIACerts(t *testing.T) {
+	a, _ := makeCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Cert A"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true,
+	}, nil, nil)
+	b, _ := makeCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "Cert B"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true,
+	}, nil, nil)
+
+	// Single DER certificate.
+	if certs, err := parseAIACerts(a.Raw); err != nil || len(certs) != 1 || certs[0].Subject.CommonName != "Cert A" {
+		t.Fatalf("DER: got %d certs, err=%v", len(certs), err)
+	}
+
+	// PKCS#7 bundle with two certificates.
+	certs, err := parseAIACerts(makePKCS7CertsOnly(t, a, b))
+	if err != nil {
+		t.Fatalf("PKCS#7: %v", err)
+	}
+	got := map[string]bool{}
+	for _, c := range certs {
+		got[c.Subject.CommonName] = true
+	}
+	if !got["Cert A"] || !got["Cert B"] {
+		t.Errorf("PKCS#7 bundle parsed to %v; want both Cert A and Cert B", got)
+	}
+}
+
+// TestChaseAIATerminatesOnCycle proves AIA chasing terminates (and still
+// completes the chain) when a fetched certificate's AIA points back into the
+// chain — a cross-signing cycle. Without the visited-set guard this recurses
+// forever; the test's timeout would catch that regression.
+func TestChaseAIATerminatesOnCycle(t *testing.T) {
+	caCert, caKey := makeCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Cycle Root"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true,
+	}, nil, nil)
+
+	// The intermediate's AIA must reference the URL that serves it, so set up the
+	// server first and fill in the bytes once the cert exists.
+	var xDER []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(xDER)
+	}))
+	defer srv.Close()
+
+	xCert, xKey := makeCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "Cycle Intermediate"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true,
+		IssuingCertificateURL: []string{srv.URL}, // points at itself
+	}, caCert, caKey)
+	xDER = xCert.Raw
+
+	leafCert, _ := makeCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "leaf"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IssuingCertificateURL: []string{srv.URL},
+	}, xCert, xKey)
+
+	roots := x509.NewCertPool()
+	roots.AddCert(caCert)
+	resetAIACache()
+
+	if _, err := chaseAIA([]*x509.Certificate{leafCert}, roots, ""); err != nil {
+		t.Fatalf("chaseAIA should complete despite the self-referential AIA: %v", err)
+	}
 }

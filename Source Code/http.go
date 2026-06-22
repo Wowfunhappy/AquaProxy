@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -728,12 +729,13 @@ func HTTPMain() {
 	// Add our CA to the system roots
 	systemRoots.AddCert(ca.Leaf)
 
-	// Configure client side with secure connections but enable AIA chasing
+	// Configure client side with secure connections but enable AIA chasing.
+	// Verification (chain + hostname + AIA chasing) is installed per-connection by
+	// dialUpstream, which needs the target hostname to verify against.
 	tlsClientConfig := &tls.Config{
 		MinVersion: tls.VersionTLS10, // Maintain decent security for outbound
 		RootCAs:    systemRoots,
 		// Let Go use default secure cipher suites for outbound connections
-		VerifyPeerCertificate: createCertVerifier(systemRoots),
 		// Enable session tickets for upstream connections
 		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 	}
@@ -766,14 +768,17 @@ func getIntermediateCerts(pool *x509.CertPool) {
 	aiaCacheMutex.RLock()
 	defer aiaCacheMutex.RUnlock()
 
-	for _, cert := range aiaCertCache {
-		pool.AddCert(cert)
+	for _, certs := range aiaCertCache {
+		for _, cert := range certs {
+			pool.AddCert(cert)
+		}
 	}
 }
 
-// createCertVerifier returns a function that verifies certificates and performs AIA chasing
-// rootCAs should include both system roots and our generated CA certificate
-func createCertVerifier(rootCAs *x509.CertPool) func([][]byte, [][]*x509.Certificate) error {
+// createCertVerifier returns a function that verifies certificates and performs AIA chasing.
+// rootCAs should include both system roots and our generated CA certificate. dnsName is the
+// hostname to verify the leaf against (empty skips the hostname check).
+func createCertVerifier(rootCAs *x509.CertPool, dnsName string) func([][]byte, [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 		// Convert raw certificates
 		certs := make([]*x509.Certificate, len(rawCerts))
@@ -799,6 +804,7 @@ func createCertVerifier(rootCAs *x509.CertPool) func([][]byte, [][]*x509.Certifi
 		opts := x509.VerifyOptions{
 			Roots:         rootCAs,
 			Intermediates: intermediatePool,
+			DNSName:       dnsName,
 			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 		}
 
@@ -809,7 +815,7 @@ func createCertVerifier(rootCAs *x509.CertPool) func([][]byte, [][]*x509.Certifi
 
 		// If verification failed, try AIA chasing
 		// AIA certificates are already cached in the chaseAIA function
-		_, chainErr := chaseAIA(certs, rootCAs)
+		_, chainErr := chaseAIA(certs, rootCAs, dnsName)
 		if chainErr == nil {
 			return nil
 		}
@@ -827,9 +833,18 @@ func createCertVerifier(rootCAs *x509.CertPool) func([][]byte, [][]*x509.Certifi
 	}
 }
 
-// chaseAIA follows AIA URLs to download missing certificates
-// rootCAs contains both system roots from macOS Keychain and our custom CA
-func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool) ([]*x509.Certificate, error) {
+// chaseAIA follows the leaf's AIA URLs to download missing issuer certificates
+// and verifies the resulting chain. rootCAs contains both system roots from the
+// macOS Keychain and our custom CA.
+func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName string) ([]*x509.Certificate, error) {
+	return chaseAIAVisited(certs, rootCAs, dnsName, map[string]bool{})
+}
+
+// chaseAIAVisited is chaseAIA with a per-chase set of already-followed URLs so
+// cross-signing cycles terminate. It always follows the chain (using the global
+// cache only to avoid re-downloading), so a warm or partially-populated cache
+// still gathers every issuer needed to build the chain.
+func chaseAIAVisited(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName string, visited map[string]bool) ([]*x509.Certificate, error) {
 	var downloadedCerts []*x509.Certificate
 	intermediates := x509.NewCertPool()
 
@@ -838,65 +853,25 @@ func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool) ([]*x509.Certif
 		intermediates.AddCert(cert)
 	}
 
-	// Check if we need to chase AIAs
 	leaf := certs[0]
 	for _, url := range leaf.IssuingCertificateURL {
-		// Check if we've already fetched this certificate by url
-		cacheKey := url
-
-		aiaCacheMutex.RLock()
-		cachedCert, found := aiaCertCache[cacheKey]
-		aiaCacheMutex.RUnlock()
-
-		if found {
-			intermediates.AddCert(cachedCert)
-			downloadedCerts = append(downloadedCerts, cachedCert)
-			continue
+		if visited[url] {
+			continue // already followed this issuer in this chase (breaks cycles)
 		}
+		visited[url] = true
 
-		resp, err := http.Get(url)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			log.Println("Failed to fetch AIA certificate:", err)
-			continue
-		}
+		for _, aiaCert := range aiaFetch(url) {
+			intermediates.AddCert(aiaCert)
+			downloadedCerts = append(downloadedCerts, aiaCert)
 
-		certData, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			log.Println("Failed to read AIA certificate:", err)
-			continue
-		}
-
-		aiaCert, err := x509.ParseCertificate(certData)
-		if err != nil {
-			// Try parsing as PEM
-			block, _ := pem.Decode(certData)
-			if block == nil {
-				log.Println("Failed to parse AIA certificate:", err)
-				continue
-			}
-
-			aiaCert, err = x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				log.Println("Failed to parse AIA certificate from PEM:", err)
-				continue
-			}
-		}
-
-		// Cache the certificate by URL
-		aiaCacheMutex.Lock()
-		aiaCertCache[cacheKey] = aiaCert
-		aiaCacheMutex.Unlock()
-
-		intermediates.AddCert(aiaCert)
-		downloadedCerts = append(downloadedCerts, aiaCert)
-
-		// Recursively check if this cert has AIAs too
-		if len(aiaCert.IssuingCertificateURL) > 0 {
-			moreCerts, _ := chaseAIA([]*x509.Certificate{aiaCert}, rootCAs)
-			downloadedCerts = append(downloadedCerts, moreCerts...)
-			for _, c := range moreCerts {
-				intermediates.AddCert(c)
+			// Recursively chase this cert's issuer too (no hostname check when
+			// fetching an issuer, only when verifying the leaf).
+			if len(aiaCert.IssuingCertificateURL) > 0 {
+				moreCerts, _ := chaseAIAVisited([]*x509.Certificate{aiaCert}, rootCAs, "", visited)
+				downloadedCerts = append(downloadedCerts, moreCerts...)
+				for _, c := range moreCerts {
+					intermediates.AddCert(c)
+				}
 			}
 		}
 	}
@@ -904,11 +879,114 @@ func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool) ([]*x509.Certif
 	opts := x509.VerifyOptions{
 		Roots:         rootCAs,
 		Intermediates: intermediates,
+		DNSName:       dnsName,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}
 
 	_, err := leaf.Verify(opts)
 	return downloadedCerts, err
+}
+
+// aiaFetch returns the certificate(s) published at an AIA caIssuers URL, using
+// the global cache to avoid re-downloading. One URL may yield several certs
+// (e.g. a root plus its cross-signed forms in a PKCS#7 bundle). A failed fetch
+// returns nil and is not cached, so it is retried on the next chase.
+func aiaFetch(url string) []*x509.Certificate {
+	aiaCacheMutex.RLock()
+	cached, found := aiaCertCache[url]
+	aiaCacheMutex.RUnlock()
+	if found {
+		return cached
+	}
+
+	resp, err := http.Get(url)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		log.Println("Failed to fetch AIA certificate:", err)
+		return nil
+	}
+	data, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		log.Println("Failed to read AIA certificate:", err)
+		return nil
+	}
+	certs, err := parseAIACerts(data)
+	if err != nil {
+		log.Println("Failed to parse AIA certificate:", err)
+		return nil
+	}
+
+	aiaCacheMutex.Lock()
+	aiaCertCache[url] = certs
+	aiaCacheMutex.Unlock()
+	return certs
+}
+
+var oidPKCS7SignedData = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
+
+// parseAIACerts parses the certificate(s) returned from an AIA caIssuers URL.
+// The response may be a single DER certificate, PEM, or — as some CAs such as
+// Sectigo serve — a PKCS#7 (.p7c) bundle containing several certificates (e.g.
+// a root together with its cross-signed form).
+func parseAIACerts(data []byte) ([]*x509.Certificate, error) {
+	// Single (or concatenated) DER certificate.
+	if certs, err := x509.ParseCertificates(data); err == nil && len(certs) > 0 {
+		return certs, nil
+	}
+
+	// PEM, possibly with multiple certificate blocks.
+	var pemCerts []*x509.Certificate
+	for rest := data; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			if c, err := x509.ParseCertificate(block.Bytes); err == nil {
+				pemCerts = append(pemCerts, c)
+			}
+		}
+	}
+	if len(pemCerts) > 0 {
+		return pemCerts, nil
+	}
+
+	// PKCS#7 "certs-only" bundle.
+	return extractPKCS7Certs(data)
+}
+
+// extractPKCS7Certs pulls the certificates out of a PKCS#7 SignedData (.p7c)
+// "certs-only" bundle. Go has no PKCS#7 support in its standard library, so we
+// unwrap the minimal structure by hand: ContentInfo → SignedData → certificates.
+func extractPKCS7Certs(data []byte) ([]*x509.Certificate, error) {
+	var ci struct {
+		ContentType asn1.ObjectIdentifier
+		Content     asn1.RawValue `asn1:"explicit,optional,tag:0"`
+	}
+	if _, err := asn1.Unmarshal(data, &ci); err != nil {
+		return nil, err
+	}
+	if !ci.ContentType.Equal(oidPKCS7SignedData) {
+		return nil, fmt.Errorf("AIA response is not a PKCS#7 signedData bundle")
+	}
+
+	var sd struct {
+		Version      int
+		DigestAlgos  asn1.RawValue
+		ContentInfo  asn1.RawValue
+		Certificates asn1.RawValue `asn1:"optional,tag:0"`
+		CRLs         asn1.RawValue `asn1:"optional,tag:1"`
+		SignerInfos  asn1.RawValue
+	}
+	if _, err := asn1.Unmarshal(ci.Content.Bytes, &sd); err != nil {
+		return nil, err
+	}
+	if len(sd.Certificates.Bytes) == 0 {
+		return nil, fmt.Errorf("PKCS#7 bundle contains no certificates")
+	}
+	// The [0] field's content is the concatenated certificate DER.
+	return x509.ParseCertificates(sd.Certificates.Bytes)
 }
 
 func loadCA() (cert tls.Certificate, err error) {
@@ -1285,6 +1363,13 @@ func (p *Proxy) dialUpstream(addr string, isTLS bool, serverName, connID string)
 		*cConfig = *p.TLSClientConfig
 	}
 	cConfig.ServerName = serverName
+	// Go aborts the handshake on an incomplete chain before VerifyPeerCertificate
+	// would run, so AIA chasing can't happen under the built-in check. Disable it
+	// and verify ourselves — chain, hostname, and AIA chasing — in the callback.
+	// (ServerName is still sent as SNI; we verify the hostname explicitly since
+	// InsecureSkipVerify also turns off Go's hostname check.)
+	cConfig.InsecureSkipVerify = true
+	cConfig.VerifyPeerCertificate = createCertVerifier(cConfig.RootCAs, serverName)
 
 	conn, err := tls.Dial("tcp", addr, cConfig)
 	if err == nil {
@@ -1297,6 +1382,7 @@ func (p *Proxy) dialUpstream(addr string, isTLS bool, serverName, connID string)
 		retryConfig := new(tls.Config)
 		*retryConfig = *cConfig
 		retryConfig.InsecureSkipVerify = true
+		retryConfig.VerifyPeerCertificate = nil // truly skip verification to capture the chain
 		if retryConn, retryErr := tls.Dial("tcp", addr, retryConfig); retryErr == nil {
 			capturedChain := retryConn.ConnectionState().PeerCertificates
 			retryConn.Close()
