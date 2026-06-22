@@ -1262,11 +1262,82 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	serverConn.Close()
 }
 
-// handleMITMWithLogging handles MITM connections with HTTP parsing and URL logging/redirects
-func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn net.Conn, host, connID string, checkRedirects bool) {
-	// Read HTTP requests from client and forward to server
+// upstreamConn is a cached connection to a single upstream target, paired with
+// its buffered reader so responses can be read across keep-alive requests.
+type upstreamConn struct {
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+// dialUpstream opens a connection to addr. When isTLS is set it performs a TLS
+// handshake using serverName; on a certificate-authority failure it retries
+// once with verification disabled, solely to log the offending chain.
+func (p *Proxy) dialUpstream(addr string, isTLS bool, serverName, connID string) (net.Conn, error) {
+	if !isTLS {
+		return net.Dial("tcp", addr)
+	}
+
+	cConfig := new(tls.Config)
+	if p.TLSClientConfig != nil {
+		*cConfig = *p.TLSClientConfig
+	}
+	cConfig.ServerName = serverName
+
+	conn, err := tls.Dial("tcp", addr, cConfig)
+	if err == nil {
+		return conn, nil
+	}
+
+	// Only if there's a certificate error, retry to capture the chain for logging
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthorityErr) {
+		retryConfig := new(tls.Config)
+		*retryConfig = *cConfig
+		retryConfig.InsecureSkipVerify = true
+		if retryConn, retryErr := tls.Dial("tcp", addr, retryConfig); retryErr == nil {
+			capturedChain := retryConn.ConnectionState().PeerCertificates
+			retryConn.Close()
+			log.Printf("[%s] Failed to connect to upstream host: %v%s", connID, err, extractCertificateChainInfo(err, capturedChain))
+			return nil, err
+		}
+	}
+	log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
+	return nil, err
+}
+
+// upstreamTarget derives the dial address, TLS flag, and SNI server name for a
+// request URL, supplying the default port for the scheme when none is given.
+func upstreamTarget(u *url.URL) (addr string, isTLS bool, serverName string) {
+	hostname := u.Hostname()
+	port := u.Port()
+	isTLS = u.Scheme != "http" // https (and CONNECT-originated requests) use TLS
+	if port == "" {
+		if isTLS {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(hostname, port), isTLS, hostname
+}
+
+// handleMITMWithLogging parses each HTTP request from an intercepted TLS
+// connection, applies header/redirect rules, and forwards it to the appropriate
+// upstream. The upstream connection is dialed lazily once the real target is
+// known (which, for redirects, depends on the full request URL) and cached per
+// target so keep-alive requests reuse the same socket instead of redialing.
+func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, defaultHost, connID string, checkRedirects bool) {
 	reader := bufio.NewReader(tlsConn)
-	serverReader := bufio.NewReader(serverConn)
+
+	// Upstream connections keyed by "scheme://host:port" so repeated requests to
+	// the same target (including redirect targets) reuse one connection.
+	conns := make(map[string]*upstreamConn)
+	defer func() {
+		for _, uc := range conns {
+			uc.conn.Close()
+		}
+		tlsConn.Close()
+	}()
 
 	for {
 		// Read the request
@@ -1275,13 +1346,13 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn net.Conn, ho
 			if err != io.EOF {
 				log.Printf("[%s] Error reading request: %v", connID, err)
 			}
-			break
+			return
 		}
 
 		// Set up the request URL
 		req.URL.Scheme = "https"
 		if req.Host == "" {
-			req.Host = host
+			req.Host = defaultHost
 		}
 		req.URL.Host = req.Host
 
@@ -1299,7 +1370,9 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn net.Conn, ho
 			applyHeaders(req, headers)
 		}
 
-		// Check for redirects if enabled for this domain
+		// Check for redirects if enabled for this domain. The target host is not
+		// known until the full request URL is parsed, which is why the upstream
+		// connection is only resolved (and dialed) after this point.
 		if checkRedirects {
 			if targetURL, shouldRedirect := checkRedirect(req.URL); shouldRedirect {
 				log.Printf("[%s] Redirecting %s → %s", connID, req.URL.String(), targetURL.String())
@@ -1312,87 +1385,21 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn net.Conn, ho
 				if headers, ok := checkHeaders(req.URL); ok {
 					applyHeaders(req, headers)
 				}
-
-				// If the target is on a different host, we need to proxy to it
-				if targetURL.Host != host {
-					// Create a new TLS connection to the target host
-					targetConfig := new(tls.Config)
-					if p.TLSClientConfig != nil {
-						*targetConfig = *p.TLSClientConfig
-					}
-					var targetConn net.Conn
-					hostname := targetURL.Hostname()
-					port := targetURL.Port()
-					if targetURL.Scheme == "https" {
-						if port == "" {
-							port = "443"
-						}
-						targetConfig.ServerName = hostname
-						targetConn, err = tls.Dial("tcp", net.JoinHostPort(hostname, port), targetConfig)
-					} else {
-						if port == "" {
-							port = "80"
-						}
-						targetConn, err = net.Dial("tcp", net.JoinHostPort(hostname, port))
-					}
-					if err != nil {
-						// Send error response to client
-						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-						break
-					}
-					defer targetConn.Close()
-
-					// Forward the request to the target
-					err = req.Write(targetConn)
-					if err != nil {
-						log.Printf("[%s] Error forwarding request to redirect target: %v", connID, err)
-						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-						break
-					}
-
-					// Read response from target
-					targetReader := bufio.NewReader(targetConn)
-					resp, err := http.ReadResponse(targetReader, req)
-					if err != nil {
-						log.Printf("[%s] Error reading response from redirect target: %v", connID, err)
-						tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-						break
-					}
-
-					// Forward response to client
-					err = resp.Write(tlsConn)
-					if err != nil {
-						log.Printf("[%s] Error writing redirect response to client: %v", connID, err)
-						resp.Body.Close()
-						break
-					}
-					resp.Body.Close()
-
-					// Continue to next request
-					continue
-				}
 			}
 		}
 
-		// Forward request to server directly
-		req.RequestURI = "" // Must be cleared for client requests
+		// Resolve the upstream target for this (possibly redirected) request.
+		addr, isTLS, serverName := upstreamTarget(req.URL)
+		key := req.URL.Scheme + "://" + addr
 
-		// Write request to server
-		err = req.Write(serverConn)
-		if err != nil {
-			log.Printf("[%s] Error writing request to server: %v", connID, err)
-			// Send error response to client
-			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-			break
-		}
+		// RequestURI must be cleared before writing an outgoing client request.
+		req.RequestURI = ""
 
-		// Read response from server
-		resp, err := http.ReadResponse(serverReader, req)
+		// Forward to the target, reusing a cached connection when possible.
+		resp, err := p.forwardRequest(req, conns, key, addr, isTLS, serverName, connID)
 		if err != nil {
-			log.Printf("[%s] Error reading response from server: %v", connID, err)
-			// Send error response to client
 			tlsConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-			break
+			return
 		}
 
 		// Write response back to client
@@ -1400,19 +1407,61 @@ func (p *Proxy) handleMITMWithLogging(tlsConn *tls.Conn, serverConn net.Conn, ho
 		if err != nil {
 			log.Printf("[%s] Error writing response to client: %v", connID, err)
 			resp.Body.Close()
-			break
+			return
 		}
 		resp.Body.Close()
 
 		// Check if connection should be closed
 		if req.Close || resp.Close {
-			break
+			return
 		}
 	}
+}
 
-	// Close connections
-	tlsConn.Close()
-	serverConn.Close()
+// forwardRequest sends req to the upstream identified by key/addr, dialing and
+// caching the connection on first use. If a reused (cached) connection fails
+// before any response is received and the request is safe to repeat, it redials
+// once on a fresh connection to recover from a stale keep-alive socket.
+func (p *Proxy) forwardRequest(req *http.Request, conns map[string]*upstreamConn, key, addr string, isTLS bool, serverName, connID string) (*http.Response, error) {
+	// Only bodyless, idempotent requests may be safely re-sent on a fresh socket.
+	canRetry := req.ContentLength == 0 &&
+		(req.Method == "GET" || req.Method == "HEAD" || req.Method == "OPTIONS" || req.Method == "TRACE")
+
+	for attempt := 0; attempt < 2; attempt++ {
+		uc := conns[key]
+		reused := uc != nil
+		if uc == nil {
+			conn, err := p.dialUpstream(addr, isTLS, serverName, connID)
+			if err != nil {
+				return nil, err
+			}
+			uc = &upstreamConn{conn: conn, reader: bufio.NewReader(conn)}
+			conns[key] = uc
+		}
+
+		if err := req.Write(uc.conn); err != nil {
+			uc.conn.Close()
+			delete(conns, key)
+			if reused && canRetry {
+				continue // stale keep-alive connection; retry on a fresh one
+			}
+			log.Printf("[%s] Error writing request to upstream %s: %v", connID, addr, err)
+			return nil, err
+		}
+
+		resp, err := http.ReadResponse(uc.reader, req)
+		if err != nil {
+			uc.conn.Close()
+			delete(conns, key)
+			if reused && canRetry {
+				continue
+			}
+			log.Printf("[%s] Error reading response from upstream %s: %v", connID, addr, err)
+			return nil, err
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("upstream %s unreachable", addr)
 }
 
 // singleUseListener implements net.Listener for a single connection
@@ -1497,90 +1546,8 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 		return
 	}
 
-	// Set up client TLS config for upstream connection
-	cConfig := new(tls.Config)
-	if p.TLSClientConfig != nil {
-		*cConfig = *p.TLSClientConfig
-	}
-	cConfig.ServerName = name
-
-	// Connect to the real server
-	var serverConn net.Conn
-	serverConn, err = tls.Dial("tcp", host, cConfig)
-	if err != nil {
-		// Check if there are redirects for this domain
-		domain := host
-		if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
-			domain = h
-		}
-
-		redirectMutex.RLock()
-		rules, hasRedirects := redirectRules[domain]
-		redirectMutex.RUnlock()
-
-		// If there are redirects, try connecting to the first redirect target
-		if hasRedirects && len(rules) > 0 {
-			// Get the first redirect rule's target host
-			targetHost := rules[0].toURL.Host
-			if targetHost != "" && targetHost != domain {
-				// Add port if not present
-				if _, _, err := net.SplitHostPort(targetHost); err != nil {
-					targetHost = targetHost + ":443"
-				}
-
-				// Try connecting to redirect target
-				var redirectConn net.Conn
-				var redirectErr error
-				if rules[0].toURL.Scheme == "https" {
-					// Update TLS config for new host
-					redirectConfig := new(tls.Config)
-					*redirectConfig = *cConfig
-					redirectConfig.ServerName = rules[0].toURL.Host
-
-					redirectConn, redirectErr = tls.Dial("tcp", targetHost, redirectConfig)
-				} else {
-					redirectConn, redirectErr = net.Dial("tcp", targetHost)
-				}
-
-				if redirectErr == nil {
-					// Success! Use this connection
-					host = targetHost
-					serverConn = redirectConn
-					err = nil
-				}
-			}
-		}
-
-		// If we still have an error (no redirects or redirect failed)
-		if err != nil {
-			// Only if there's a certificate error, retry to capture the chain
-			var unknownAuthorityErr x509.UnknownAuthorityError
-			if errors.As(err, &unknownAuthorityErr) {
-				// Retry with InsecureSkipVerify to capture the chain
-				var capturedChain []*x509.Certificate
-				retryConfig := new(tls.Config)
-				*retryConfig = *cConfig
-				retryConfig.InsecureSkipVerify = true
-
-				// Quick connection just to get the chain
-				if retryConn, retryErr := tls.Dial("tcp", host, retryConfig); retryErr == nil {
-					// tls.Dial returns a *tls.Conn directly
-					capturedChain = retryConn.ConnectionState().PeerCertificates
-					retryConn.Close()
-					log.Printf("[%s] Failed to connect to upstream host: %v%s", connID, err, extractCertificateChainInfo(err, capturedChain))
-				} else {
-					log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
-				}
-			} else {
-				log.Printf("[%s] Failed to connect to upstream host: %v", connID, err)
-			}
-			tlsConn.Close()
-			return
-		}
-	}
-
-	// Check if domain has redirect or header rules
-	// Extract domain without port
+	// Determine whether this connection needs HTTP-level handling (URL logging,
+	// header rewriting, or redirects). Rule lookups use the original host.
 	domain := orighost
 	if h, _, err := net.SplitHostPort(orighost); err == nil {
 		domain = h
@@ -1592,34 +1559,44 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 
 	hasHeaders := hasHeaderRules(domain)
 
-	// If URL logging is enabled OR domain has redirects/headers, parse HTTP requests
+	// If URL logging is enabled OR the domain has redirect/header rules, parse
+	// HTTP requests. The upstream connection is dialed lazily inside the handler
+	// once the real target is known, so a request whose redirect points at a
+	// live host still succeeds even when the original host is down.
 	if *logURLs || hasRedirects || hasHeaders {
-		// Parse and handle HTTP requests
-		p.handleMITMWithLogging(tlsConn, serverConn, host, connID, hasRedirects)
-	} else {
-		// Use efficient raw TCP/TLS forwarding
-		done := make(chan bool, 2)
-
-		// Client to server
-		go func() {
-			copyData(serverConn, tlsConn, connID, "Client→Server")
-			done <- true
-		}()
-
-		// Server to client
-		go func() {
-			copyData(tlsConn, serverConn, connID, "Server→Client")
-			done <- true
-		}()
-
-		// Wait for both directions to complete
-		<-done
-		<-done
-
-		// Now close both connections
-		tlsConn.Close()
-		serverConn.Close()
+		p.handleMITMWithLogging(tlsConn, orighost, connID, hasRedirects)
+		return
 	}
+
+	// Otherwise no per-request inspection is needed: dial the upstream once and
+	// splice raw TLS bytes in both directions.
+	serverConn, err := p.dialUpstream(host, true, name, connID)
+	if err != nil {
+		tlsConn.Close()
+		return
+	}
+
+	done := make(chan bool, 2)
+
+	// Client to server
+	go func() {
+		copyData(serverConn, tlsConn, connID, "Client→Server")
+		done <- true
+	}()
+
+	// Server to client
+	go func() {
+		copyData(tlsConn, serverConn, connID, "Server→Client")
+		done <- true
+	}()
+
+	// Wait for both directions to complete
+	<-done
+	<-done
+
+	// Now close both connections
+	tlsConn.Close()
+	serverConn.Close()
 }
 
 // extractCertificateChainInfo analyzes the certificate chain to identify the missing root
