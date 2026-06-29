@@ -553,7 +553,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.03.30</string>
+				<string>2026.06.29</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
