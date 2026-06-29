@@ -13,3 +13,5 @@ insert_dylib --inplace libMacportsLegacySupport.dylib aquaproxy-64
 insert_dylib --inplace libMacportsLegacySupport.dylib aquaproxy-32
 
 lipo -create aquaproxy-64 aquaproxy-32 -output aquaproxy
+
+codesign --force --sign - aquaproxy
