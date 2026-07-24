@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -831,4 +832,167 @@ func TestChaseAIATerminatesOnCycle(t *testing.T) {
 	if _, err := chaseAIA([]*x509.Certificate{leafCert}, roots, ""); err != nil {
 		t.Fatalf("chaseAIA should complete despite the self-referential AIA: %v", err)
 	}
+}
+
+// --- integration test for the raw-splice MITM path -----------------------
+
+// TestMITMSplicePropagatesUpstreamClose covers the path serveMITM takes when no
+// per-request inspection is needed: the two connections are spliced raw. A
+// response whose length is delimited only by the connection closing (no
+// Content-Length, no Transfer-Encoding) must still terminate for the client.
+//
+// Without a half-close, the upstream's EOF ends only the server→client copy;
+// the client is never told the body finished, so it waits forever, and the
+// client→server copy stays blocked on a read that will never return — leaking
+// both connections. www.myconnectnyc.org serves exactly this shape of response
+// on its root path, and it hung indefinitely in Safari.
+func TestMITMSplicePropagatesUpstreamClose(t *testing.T) {
+	defer resetRedirects()
+	resetRedirects()
+
+	const wantBody = "redirecting"
+
+	upstreamCA := testCA(t, "Upstream Test CA")
+	roots := x509.NewCertPool()
+	roots.AddCert(upstreamCA.Leaf)
+
+	// Upstream serves one close-delimited response, then closes.
+	upstream, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{issueServerCert(t, upstreamCA)},
+	})
+	if err != nil {
+		t.Fatalf("upstream listen: %v", err)
+	}
+	defer upstream.Close()
+	go func() {
+		c, err := upstream.Accept()
+		if err != nil {
+			return
+		}
+		http.ReadRequest(bufio.NewReader(c))
+		// Note the nonstandard reason phrase, matching the origin that exposed
+		// this: it must not stop the response from being relayed.
+		io.WriteString(c, "HTTP/1.1 302 Found : Moved Temporarily\r\n"+
+			"Location: /MyChart\r\nConnection: close\r\n\r\n"+wantBody)
+		c.Close()
+	}()
+
+	clientLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientLn.Close()
+
+	p := &Proxy{CA: testCA(t, "AquaProxy Test CA"), TLSClientConfig: &tls.Config{RootCAs: roots}}
+	p.upstreamTransport = p.newUpstreamTransport()
+
+	// serveMITM returning proves both copy goroutines finished and both
+	// connections were closed once the client acted on the half-close.
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		c, err := clientLn.Accept()
+		if err != nil {
+			return
+		}
+		p.serveMITM(c, upstream.Addr().String(), "foo.com", nil, "test")
+	}()
+
+	client, err := tls.Dial("tcp", clientLn.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true, ServerName: "foo.com",
+	})
+	if err != nil {
+		t.Fatalf("client dial: %v", err)
+	}
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(10 * time.Second))
+
+	if _, err := io.WriteString(client, "GET / HTTP/1.1\r\nHost: foo.com\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("status %d; want 302", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "/MyChart" {
+		t.Errorf("Location %q; want /MyChart", got)
+	}
+
+	// The response is delimited by the close, so this only returns once the
+	// upstream's EOF has been propagated to the client.
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("close-delimited body never terminated for the client: %v", err)
+	}
+	if string(body) != wantBody {
+		t.Errorf("body %q; want %q", body, wantBody)
+	}
+
+	// A real client closes once it sees the half-close; that must unwind the
+	// remaining copy goroutine so neither connection is left behind.
+	client.Close()
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveMITM did not return; both spliced connections leaked")
+	}
+}
+
+// testCA returns a self-signed RSA CA. RSA because genCert signs leaves with
+// SHA256WithRSA.
+func testCA(t *testing.T, cn string) *tls.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse CA cert: %v", err)
+	}
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+}
+
+// issueServerCert signs a server certificate for foo.com/127.0.0.1 with ca, so
+// the proxy's upstream verifier accepts it against RootCAs.
+func issueServerCert(t *testing.T, ca *tls.Certificate) tls.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generate server key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "foo.com"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"foo.com"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Leaf, &key.PublicKey, ca.PrivateKey)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }

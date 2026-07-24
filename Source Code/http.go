@@ -1294,9 +1294,18 @@ func dnsName(addr string) string {
 	return host
 }
 
-// copyData copies data between connections without closing them
+// copyData copies from src to dst until src reaches EOF, then half-closes dst's
+// write side. The half-close sends a TCP FIN (*net.TCPConn) or a TLS close_notify
+// (*tls.Conn) so the peer feeding dst learns this direction has ended and can
+// close its own side. Without it, a one-way disconnect leaves the opposite
+// connection — and both file descriptors — open until it happens to time out on
+// its own, which under load lets sockets accumulate until the process runs out
+// of file descriptors.
 func copyData(dst, src net.Conn, connID, direction string) {
 	io.Copy(dst, src)
+	if hc, ok := dst.(interface{ CloseWrite() error }); ok {
+		hc.CloseWrite()
+	}
 }
 
 // passthroughConnection handles a connection in passthrough mode without TLS interception
@@ -1321,23 +1330,15 @@ func (p *Proxy) passthroughConnection(clientConn net.Conn, host string, clientHe
 	// Set up bidirectional copying
 	done := make(chan bool, 2)
 
-	// Client to server
+	// Client to server (copyData half-closes the server's write side at EOF)
 	go func() {
 		copyData(serverConn, clientConn, connID, "Client→Server")
-		// Half-close: signal EOF to server but keep reading
-		if tcpConn, ok := serverConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		}
 		done <- true
 	}()
 
-	// Server to client
+	// Server to client (copyData half-closes the client's write side at EOF)
 	go func() {
 		copyData(clientConn, serverConn, connID, "Server→Client")
-		// Half-close: signal EOF to client but keep reading
-		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		}
 		done <- true
 	}()
 
@@ -1616,13 +1617,15 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 
 	done := make(chan bool, 2)
 
-	// Client to server
+	// Client to server (copyData half-closes the upstream's write side at EOF, so
+	// a client disconnect is propagated to the upstream instead of leaving it —
+	// and its file descriptor — open until it times out on its own)
 	go func() {
 		copyData(serverConn, tlsConn, connID, "Client→Server")
 		done <- true
 	}()
 
-	// Server to client
+	// Server to client (copyData half-closes the client's write side at EOF)
 	go func() {
 		copyData(tlsConn, serverConn, connID, "Server→Client")
 		done <- true
