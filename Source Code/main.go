@@ -28,8 +28,10 @@ var (
 	aiaCertCache  = make(map[string][]*x509.Certificate)
 	aiaCacheMutex sync.RWMutex
 
-	// Cache for generated leaf certificates
+	// Cache for generated leaf certificates, with the insertion order needed to
+	// evict the oldest once it is full
 	leafCertCache = make(map[string]*tls.Certificate)
+	leafCertOrder []string
 	leafCertMutex sync.RWMutex
 
 	// Pre-generated RSA keys for fast certificate generation

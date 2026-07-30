@@ -11,7 +11,6 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -645,14 +644,8 @@ func loadExclusionRules() error {
 }
 
 func HTTPMain() {
-	// Read flags from flags.txt if it exists
-	if data, err := ioutil.ReadFile("flags.txt"); err == nil {
-		flags := strings.Fields(string(data))
-		os.Args = append([]string{os.Args[0]}, append(flags, os.Args[1:]...)...)
-	}
-
-	// Parse command line flags
-	flag.Parse()
+	// flags.txt is already folded into os.Args and parsed by main; reading it a
+	// second time here would prepend the same flags again.
 
 	// Setup CPU profiling if requested
 	if *cpuProfile {
@@ -760,7 +753,17 @@ func HTTPMain() {
 	if *allowRemoteConnections {
 		log.Println("Remote connections are ALLOWED")
 	}
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *httpPort), p))
+
+	listeners, err := proxyListeners(*httpPort)
+	if err != nil {
+		log.Fatalf("Could not listen on port %d: %v", *httpPort, err)
+	}
+	errs := make(chan error, len(listeners))
+	for _, l := range listeners {
+		l := l
+		go func() { errs <- http.Serve(l, p) }()
+	}
+	log.Fatal(<-errs)
 }
 
 // getIntermediateCerts retrieves cached certificates for the provided pool
@@ -801,11 +804,15 @@ func createCertVerifier(rootCAs *x509.CertPool, dnsName string) func([][]byte, [
 			intermediatePool.AddCert(cert)
 		}
 
+		// ExtKeyUsageServerAuth, not ExtKeyUsageAny: the latter switches off
+		// extended-key-usage checking altogether, which would accept a certificate
+		// a public CA issued for S/MIME, client authentication, or code signing as
+		// proof of a server's identity.
 		opts := x509.VerifyOptions{
 			Roots:         rootCAs,
 			Intermediates: intermediatePool,
 			DNSName:       dnsName,
-			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		}
 
 		_, err := certs[0].Verify(opts)
@@ -837,14 +844,14 @@ func createCertVerifier(rootCAs *x509.CertPool, dnsName string) func([][]byte, [
 // and verifies the resulting chain. rootCAs contains both system roots from the
 // macOS Keychain and our custom CA.
 func chaseAIA(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName string) ([]*x509.Certificate, error) {
-	return chaseAIAVisited(certs, rootCAs, dnsName, map[string]bool{})
+	return chaseAIAVisited(certs, rootCAs, dnsName, map[string]bool{}, 0)
 }
 
 // chaseAIAVisited is chaseAIA with a per-chase set of already-followed URLs so
 // cross-signing cycles terminate. It always follows the chain (using the global
 // cache only to avoid re-downloading), so a warm or partially-populated cache
 // still gathers every issuer needed to build the chain.
-func chaseAIAVisited(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName string, visited map[string]bool) ([]*x509.Certificate, error) {
+func chaseAIAVisited(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName string, visited map[string]bool, depth int) ([]*x509.Certificate, error) {
 	var downloadedCerts []*x509.Certificate
 	intermediates := x509.NewCertPool()
 
@@ -858,6 +865,13 @@ func chaseAIAVisited(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName 
 		if visited[url] {
 			continue // already followed this issuer in this chase (breaks cycles)
 		}
+		// The visited set stops a chase from revisiting a URL, but not from being
+		// led through an endless supply of fresh ones: a hostile bundle can hand
+		// back certificates carrying new AIA URLs at every level. Cap the total.
+		if len(visited) >= aiaMaxFetches {
+			log.Printf("AIA chase reached the %d-fetch limit; giving up on remaining issuers", aiaMaxFetches)
+			break
+		}
 		visited[url] = true
 
 		for _, aiaCert := range aiaFetch(url) {
@@ -866,8 +880,8 @@ func chaseAIAVisited(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName 
 
 			// Recursively chase this cert's issuer too (no hostname check when
 			// fetching an issuer, only when verifying the leaf).
-			if len(aiaCert.IssuingCertificateURL) > 0 {
-				moreCerts, _ := chaseAIAVisited([]*x509.Certificate{aiaCert}, rootCAs, "", visited)
+			if depth+1 < aiaMaxDepth && len(aiaCert.IssuingCertificateURL) > 0 {
+				moreCerts, _ := chaseAIAVisited([]*x509.Certificate{aiaCert}, rootCAs, "", visited, depth+1)
 				downloadedCerts = append(downloadedCerts, moreCerts...)
 				for _, c := range moreCerts {
 					intermediates.AddCert(c)
@@ -880,34 +894,135 @@ func chaseAIAVisited(certs []*x509.Certificate, rootCAs *x509.CertPool, dnsName 
 		Roots:         rootCAs,
 		Intermediates: intermediates,
 		DNSName:       dnsName,
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
 	_, err := leaf.Verify(opts)
 	return downloadedCerts, err
 }
 
+// Bounds on AIA chasing.
+const (
+	aiaFetchTimeout    = 30 * time.Second
+	aiaMaxResponseSize = 1 << 20 // 1 MiB
+	aiaMaxFetches      = 10      // per chase
+	aiaMaxDepth        = 6
+	aiaMaxCacheEntries = 256
+)
+
+// aiaAllowPrivateHosts permits AIA fetches to loopback and private addresses.
+// It is false in production; tests that serve AIA responses from httptest
+// servers on 127.0.0.1 set it.
+var aiaAllowPrivateHosts = false
+
+// aiaClient fetches AIA certificates. Its dialer vets the address actually being
+// connected to rather than the hostname, so a caIssuers URL whose DNS answers
+// with 127.0.0.1 — or rebinds to it after an earlier lookup — is refused just
+// the same. The proxy runs on the user's own machine, which is exactly what
+// makes it a useful vantage point for an attacker who can choose these URLs.
+var aiaClient = &http.Client{
+	Timeout: aiaFetchTimeout,
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 5 * time.Second,
+			Control: blockNonPublicAddress,
+		}).DialContext,
+		DisableKeepAlives:   true,
+		TLSHandshakeTimeout: 5 * time.Second,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects fetching AIA certificate")
+		}
+		return nil
+	},
+}
+
+// blockNonPublicAddress is a net.Dialer Control hook that refuses connections to
+// anything not routable on the public internet.
+func blockNonPublicAddress(network, address string, _ syscall.RawConn) error {
+	if aiaAllowPrivateHosts {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("AIA: cannot parse dial address %q", address)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("AIA: unresolved dial address %q", address)
+	}
+	if !isPublicIP(ip) {
+		return fmt.Errorf("AIA: refusing to fetch from non-public address %s", ip)
+	}
+	return nil
+}
+
+// isPublicIP reports whether ip is routable on the public internet. Go 1.13
+// predates net.IP.IsPrivate, so the reserved ranges are spelled out.
+func isPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		switch {
+		case v4[0] == 10: // 10.0.0.0/8
+			return false
+		case v4[0] == 172 && v4[1]&0xf0 == 16: // 172.16.0.0/12
+			return false
+		case v4[0] == 192 && v4[1] == 168: // 192.168.0.0/16
+			return false
+		case v4[0] == 100 && v4[1]&0xc0 == 64: // 100.64.0.0/10 (CGNAT)
+			return false
+		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24
+			return false
+		case v4[0] == 198 && v4[1]&0xfe == 18: // 198.18.0.0/15 (benchmarking)
+			return false
+		}
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc { // fc00::/7 (unique local)
+		return false
+	}
+	return true
+}
+
 // aiaFetch returns the certificate(s) published at an AIA caIssuers URL, using
 // the global cache to avoid re-downloading. One URL may yield several certs
 // (e.g. a root plus its cross-signed forms in a PKCS#7 bundle). A failed fetch
 // returns nil and is not cached, so it is retried on the next chase.
-func aiaFetch(url string) []*x509.Certificate {
+func aiaFetch(rawURL string) []*x509.Certificate {
 	aiaCacheMutex.RLock()
-	cached, found := aiaCertCache[url]
+	cached, found := aiaCertCache[rawURL]
 	aiaCacheMutex.RUnlock()
 	if found {
 		return cached
 	}
 
-	resp, err := http.Get(url)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		log.Printf("Ignoring AIA URL with unsupported scheme: %q", rawURL)
+		return nil
+	}
+
+	resp, err := aiaClient.Get(rawURL)
+	if err != nil {
 		log.Println("Failed to fetch AIA certificate:", err)
 		return nil
 	}
-	data, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Failed to fetch AIA certificate: %s returned %s", rawURL, resp.Status)
+		return nil
+	}
+	data, err := ioutil.ReadAll(io.LimitReader(resp.Body, aiaMaxResponseSize+1))
 	if err != nil {
 		log.Println("Failed to read AIA certificate:", err)
+		return nil
+	}
+	if len(data) > aiaMaxResponseSize {
+		log.Printf("AIA response from %s exceeds %d bytes; ignoring", rawURL, aiaMaxResponseSize)
 		return nil
 	}
 	certs, err := parseAIACerts(data)
@@ -916,10 +1031,28 @@ func aiaFetch(url string) []*x509.Certificate {
 		return nil
 	}
 
-	aiaCacheMutex.Lock()
-	aiaCertCache[url] = certs
-	aiaCacheMutex.Unlock()
+	cacheAIACerts(rawURL, certs)
 	return certs
+}
+
+// cacheAIACerts stores certs under url, bounding the cache. The entries come
+// from untrusted servers and every cached certificate is offered as a candidate
+// intermediate on every later verification, so this map must not be allowed to
+// grow without limit.
+func cacheAIACerts(url string, certs []*x509.Certificate) {
+	aiaCacheMutex.Lock()
+	defer aiaCacheMutex.Unlock()
+
+	if _, exists := aiaCertCache[url]; !exists {
+		for len(aiaCertCache) >= aiaMaxCacheEntries {
+			// Go randomises map iteration order, so this evicts an arbitrary entry.
+			for k := range aiaCertCache {
+				delete(aiaCertCache, k)
+				break
+			}
+		}
+	}
+	aiaCertCache[url] = certs
 }
 
 var oidPKCS7SignedData = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
@@ -987,6 +1120,40 @@ func extractPKCS7Certs(data []byte) ([]*x509.Certificate, error) {
 	}
 	// The [0] field's content is the concatenated certificate DER.
 	return x509.ParseCertificates(sd.Certificates.Bytes)
+}
+
+// proxyListeners returns the listeners the proxy should serve on. Unless remote
+// connections are explicitly allowed it binds the loopback interfaces only:
+// every entry point already rejects non-loopback peers, but doing it at bind
+// time means the network never reaches the HTTP and mail parsers at all. Both
+// IPv4 and IPv6 loopback are bound, since "localhost" may resolve to either.
+func proxyListeners(port int) ([]net.Listener, error) {
+	if *allowRemoteConnections {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return nil, err
+		}
+		return []net.Listener{l}, nil
+	}
+
+	var (
+		listeners []net.Listener
+		firstErr  error
+	)
+	for _, host := range []string{"127.0.0.1", "[::1]"} {
+		l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		listeners = append(listeners, l)
+	}
+	if len(listeners) == 0 {
+		return nil, firstErr
+	}
+	return listeners, nil
 }
 
 func loadCA() (cert tls.Certificate, err error) {
@@ -1237,9 +1404,31 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// leafCertCacheMax bounds the generated-certificate cache. The key is the name
+// the client asked for via SNI, so a page that provokes connections to endless
+// distinct subdomains would otherwise grow this map without limit.
+var leafCertCacheMax = 512
+
+// removeLeafCertOrder drops key from the insertion-order list that drives
+// eviction, keeping it in step with the cache itself. Without this an entry
+// dropped for expiry would leave its key behind, and regenerating the same
+// certificate would append a second copy — a slow leak the size bound on the
+// map alone does not catch. Must be called with leafCertMutex held.
+func removeLeafCertOrder(key string) {
+	for i, k := range leafCertOrder {
+		if k == key {
+			leafCertOrder = append(leafCertOrder[:i], leafCertOrder[i+1:]...)
+			return
+		}
+	}
+}
+
 func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 	// Create a cache key from the domain names
 	cacheKey := names[0]
+	if cacheKey == "" {
+		return nil, errors.New("cannot generate a certificate for an empty name")
+	}
 
 	// Check if we have a cached certificate for this domain
 	leafCertMutex.RLock()
@@ -1257,6 +1446,7 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 		// Certificate expired, remove from cache
 		leafCertMutex.Lock()
 		delete(leafCertCache, cacheKey)
+		removeLeafCertOrder(cacheKey)
 		leafCertMutex.Unlock()
 	}
 
@@ -1267,8 +1457,17 @@ func (p *Proxy) cert(names ...string) (*tls.Certificate, error) {
 		return nil, err
 	}
 
-	// Cache the new certificate
+	// Cache the new certificate, evicting the oldest entries once the cache is
+	// full so an attacker-chosen stream of SNI names cannot exhaust memory.
 	leafCertMutex.Lock()
+	if _, exists := leafCertCache[cacheKey]; !exists {
+		for len(leafCertCache) >= leafCertCacheMax && len(leafCertOrder) > 0 {
+			oldest := leafCertOrder[0]
+			leafCertOrder = leafCertOrder[1:]
+			delete(leafCertCache, oldest)
+		}
+		leafCertOrder = append(leafCertOrder, cacheKey)
+	}
 	leafCertCache[cacheKey] = cert
 	leafCertMutex.Unlock()
 
@@ -1556,8 +1755,10 @@ func (p *Proxy) serveMITM(clientConn net.Conn, host, name string, clientHello *c
 	}
 	sConfig.Certificates = []tls.Certificate{*cert}
 	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		// Only request a new cert if the ServerName differs from our initial one
-		if hello.ServerName == name {
+		// Only request a new cert if the ServerName differs from our initial one.
+		// A client that sends no SNI at all gets the CONNECT-derived certificate
+		// rather than provoking a pointless key generation for the empty name.
+		if hello.ServerName == "" || hello.ServerName == name {
 			return cert, nil
 		}
 

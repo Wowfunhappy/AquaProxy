@@ -28,6 +28,9 @@ import (
 func TestMain(m *testing.M) {
 	// Keep proxy log output from cluttering test results.
 	log.SetOutput(ioutil.Discard)
+	// The AIA tests serve issuer certificates from httptest servers on 127.0.0.1,
+	// which the production SSRF guard refuses to dial.
+	aiaAllowPrivateHosts = true
 	os.Exit(m.Run())
 }
 

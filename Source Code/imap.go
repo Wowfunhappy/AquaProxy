@@ -10,8 +10,14 @@ import (
 	"log"
 	"net"
 	"regexp"
+	rdebug "runtime/debug" // aliased: the package name collides with the -debug flag
 	"strings"
 )
+
+// maxIMAPResponseBytes bounds how much of an untagged IMAP response is buffered
+// while waiting for the tagged line that ends it. Without a limit a hostile (or
+// merely broken) server can grow the buffer until the proxy runs out of memory.
+const maxIMAPResponseBytes = 1 << 20
 
 // MailProxy handles IMAP and SMTP proxy connections
 type MailProxy struct {
@@ -108,30 +114,37 @@ func IMAPMain() {
 
 // Start starts the mail proxy listener
 func (mp *MailProxy) Start() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", mp.Port))
+	listeners, err := proxyListeners(mp.Port)
 	if err != nil {
 		return fmt.Errorf("failed to start %s proxy on port %d: %w", mp.Protocol, mp.Port, err)
 	}
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if mp.Debug {
-					log.Printf("%s proxy accept error: %v", mp.Protocol, err)
+	for _, listener := range listeners {
+		listener := listener
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					if mp.Debug {
+						log.Printf("%s proxy accept error: %v", mp.Protocol, err)
+					}
+					continue
 				}
-				continue
-			}
 
-			go mp.handleConnection(conn)
-		}
-	}()
+				go mp.handleConnection(conn)
+			}
+		}()
+	}
 
 	return nil
 }
 
 // handleConnection handles a single client connection
 func (mp *MailProxy) handleConnection(clientConn net.Conn) {
+	// A panic while handling one connection must not take down the process, which
+	// also serves the HTTP proxy and every other mail session.
+	defer recoverConn(fmt.Sprintf("%s-%p", mp.Protocol, clientConn))
+
 	// Check if connection is from localhost unless allow-remote-connections is set
 	if !*allowRemoteConnections {
 		host, _, err := net.SplitHostPort(clientConn.RemoteAddr().String())
@@ -199,8 +212,10 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 			log.Printf("[%s] Client: %s", mc.id, strings.TrimSpace(line))
 		}
 
-		// Parse IMAP command
-		parts := strings.Fields(line)
+		// Parse IMAP command. parseIMAPArgs honours quoting, so an argument that
+		// contains a space — a password, most often — survives intact instead of
+		// being split into fragments.
+		parts := parseIMAPArgs(line)
 		if len(parts) < 2 {
 			mc.writer.WriteString("* BAD Invalid command\r\n")
 			mc.writer.Flush()
@@ -210,11 +225,19 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 		tag := parts[0]
 		command := strings.ToUpper(parts[1])
 
+		// The tag is echoed verbatim into the commands sent upstream, so it must be
+		// a plain IMAP atom and nothing that could end the line early.
+		if !validIMAPTag(tag) {
+			mc.writer.WriteString("* BAD Invalid tag\r\n")
+			mc.writer.Flush()
+			return
+		}
+
 		// Check for authentication commands
 		if command == "LOGIN" && len(parts) >= 4 {
 			// Extract username and password
-			username := strings.Trim(parts[2], "\"")
-			password := strings.Trim(parts[3], "\"")
+			username := parts[2]
+			password := parts[3]
 
 			// Parse username for server info
 			if err := mc.parseUsername(username); err != nil {
@@ -242,13 +265,20 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 				log.Printf("[%s] Server: %s", mc.id, strings.TrimSpace(serverGreeting))
 			}
 
-			// Send real login command
-			realLogin := fmt.Sprintf("%s LOGIN \"%s\" \"%s\"\r\n", tag, mc.realUsername, password)
+			// Send real login command. Both arguments are quoted and escaped: they
+			// are client-supplied, and interpolating them raw would let a quote or
+			// CRLF inject additional commands into the upstream session.
+			if strings.ContainsAny(password, "\r\n\x00") {
+				mc.writer.WriteString(fmt.Sprintf("%s NO Invalid password\r\n", tag))
+				mc.writer.Flush()
+				return
+			}
+			realLogin := fmt.Sprintf("%s LOGIN %s %s\r\n", tag, imapQuote(mc.realUsername), imapQuote(password))
 			mc.serverWriter.WriteString(realLogin)
 			mc.serverWriter.Flush()
 
 			// Read response
-			response, err := mc.readIMAPResponse(tag)
+			response, ok, err := mc.readIMAPResponse(tag)
 			if err != nil {
 				mc.writer.WriteString(fmt.Sprintf("%s NO Authentication failed\r\n", tag))
 				mc.writer.Flush()
@@ -260,7 +290,7 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 			mc.writer.Flush()
 
 			// Check if authentication succeeded
-			if strings.Contains(response, tag+" OK") {
+			if ok {
 				mc.authenticated = true
 				if mp.Debug {
 					log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
@@ -352,7 +382,7 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 				mc.serverWriter.Flush()
 
 				// Read response
-				response, err := mc.readIMAPResponse(tag)
+				response, ok, err := mc.readIMAPResponse(tag)
 				if err != nil {
 					mc.writer.WriteString(fmt.Sprintf("%s NO Authentication failed\r\n", tag))
 					mc.writer.Flush()
@@ -364,7 +394,7 @@ func (mp *MailProxy) handleIMAP(mc *MailConnection) {
 				mc.writer.Flush()
 
 				// Check if authentication succeeded
-				if strings.Contains(response, tag+" OK") {
+				if ok {
 					mc.authenticated = true
 					if mp.Debug {
 						log.Printf("[%s] Successfully authenticated to %s", mc.id, mc.targetServer)
@@ -427,15 +457,23 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 			log.Printf("[%s] Client: %s", mc.id, strings.TrimSpace(line))
 		}
 
-		// Parse SMTP command
-		command := strings.ToUpper(strings.Fields(line)[0])
+		// Parse SMTP command. A line with no fields at all — the blank line that
+		// ends the headers of any HTTP request, which is all it takes for a web
+		// page to reach this port — must not index past the end of the slice.
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			mc.writer.WriteString("500 Syntax error, command unrecognized\r\n")
+			mc.writer.Flush()
+			continue
+		}
+		command := strings.ToUpper(fields[0])
 
 		switch command {
 		case "EHLO", "HELO":
 			// Respond with capabilities
 			domain := "localhost"
-			if len(strings.Fields(line)) > 1 {
-				domain = strings.Fields(line)[1]
+			if len(fields) > 1 {
+				domain = fields[1]
 			}
 
 			if command == "EHLO" {
@@ -450,7 +488,7 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 
 		case "AUTH":
 			// Parse AUTH command
-			authParts := strings.Fields(line)
+			authParts := fields
 			if len(authParts) < 2 {
 				mc.writer.WriteString("501 Syntax error\r\n")
 				mc.writer.Flush()
@@ -694,6 +732,15 @@ func (mp *MailProxy) handleSMTP(mc *MailConnection) {
 
 // parseUsername extracts the real username and target server from the proxy username
 func (mc *MailConnection) parseUsername(username string) error {
+	// The username arrives either straight off the wire or base64-decoded from an
+	// AUTH exchange, so it can carry anything at all. Both halves end up inside
+	// commands sent upstream; a control character there would let the client
+	// append commands of its own, and the server half additionally decides where
+	// the proxy connects.
+	if strings.ContainsAny(username, "\r\n\x00 \t") {
+		return fmt.Errorf("invalid characters in username")
+	}
+
 	// Username format: realuser@domain@server
 	lastAt := strings.LastIndex(username, "@")
 	if lastAt == -1 || lastAt == 0 || lastAt == len(username)-1 {
@@ -704,7 +751,10 @@ func (mc *MailConnection) parseUsername(username string) error {
 	mc.targetServer = username[lastAt+1:]
 
 	// Validate server name
-	if mc.targetServer == "" || mc.targetServer == "localhost" {
+	if mc.targetServer == "" || strings.EqualFold(mc.serverName(), "localhost") {
+		return fmt.Errorf("invalid target server")
+	}
+	if strings.ContainsAny(mc.targetServer, "/\\@") {
 		return fmt.Errorf("invalid target server")
 	}
 
@@ -712,6 +762,16 @@ func (mc *MailConnection) parseUsername(username string) error {
 		log.Printf("[%s] Parsed username: %s -> server: %s", mc.id, mc.realUsername, mc.targetServer)
 	}
 	return nil
+}
+
+// serverName returns the target server's hostname without any port. Certificate
+// verification matches against this, so the port must be stripped — a
+// ServerName of "mail.example.com:993" matches no certificate at all.
+func (mc *MailConnection) serverName() string {
+	if h, _, err := net.SplitHostPort(mc.targetServer); err == nil {
+		return h
+	}
+	return mc.targetServer
 }
 
 // connectToServer establishes connection to the real mail server
@@ -729,11 +789,11 @@ func (mc *MailConnection) connectToServer(tlsConfig *tls.Config, port int) error
 	// For SMTP on port 465, use direct TLS
 	if mc.protocol == "SMTP" && port == 465 {
 		tlsConf := &tls.Config{
-			ServerName: mc.targetServer,
+			ServerName: mc.serverName(),
 		}
 		if tlsConfig != nil {
 			*tlsConf = *tlsConfig
-			tlsConf.ServerName = mc.targetServer
+			tlsConf.ServerName = mc.serverName()
 		}
 
 		conn, err := tls.Dial("tcp", server, tlsConf)
@@ -755,11 +815,11 @@ func (mc *MailConnection) connectToServer(tlsConfig *tls.Config, port int) error
 		// For IMAP, always upgrade to TLS immediately
 		if mc.protocol == "IMAP" {
 			tlsConf := &tls.Config{
-				ServerName: mc.targetServer,
+				ServerName: mc.serverName(),
 			}
 			if tlsConfig != nil {
 				*tlsConf = *tlsConfig
-				tlsConf.ServerName = mc.targetServer
+				tlsConf.ServerName = mc.serverName()
 			}
 
 			tlsConn := tls.Client(conn, tlsConf)
@@ -807,8 +867,10 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string, 
 			log.Printf("[%s] Server: %s", mc.id, strings.TrimSpace(line))
 		}
 
-		// Check for STARTTLS support
-		if !mc.tlsEnabled && strings.Contains(line, "STARTTLS") {
+		// Check for STARTTLS support. Match the capability itself rather than the
+		// line, so a greeting or hostname that happens to contain the word does
+		// not count as an offer.
+		if !mc.tlsEnabled && isSMTPCapability(line, "STARTTLS") {
 			hasSTARTTLS = true
 		}
 
@@ -853,6 +915,14 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string, 
 
 		if mc.debug {
 			log.Printf("[%s] Starting TLS handshake with %s", mc.id, mc.targetServer)
+		}
+
+		// Anything already buffered was sent before the handshake began, so it is
+		// unauthenticated data the server could not have known we would accept —
+		// the classic STARTTLS command-injection trick. Discarding it silently
+		// would hide the attack; refuse the connection instead.
+		if n := mc.serverReader.Buffered(); n > 0 {
+			return fmt.Errorf("server sent %d bytes before the TLS handshake (STARTTLS command injection?)", n)
 		}
 
 		tlsConn := tls.Client(mc.serverConn, tlsConf)
@@ -905,6 +975,16 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string, 
 				break
 			}
 		}
+	}
+
+	// Reaching here without TLS means the EHLO response advertised no STARTTLS, so
+	// unencrypted AUTH is the only form this server accepts. Deliberately send it
+	// anyway: a provider that never gained STARTTLS is exactly the kind this proxy
+	// exists to keep reachable, and refusing would only mean the account cannot be
+	// used at all. Note it in the log, since anyone on the path can read what
+	// follows — including an attacker who stripped the capability to cause this.
+	if !mc.tlsEnabled {
+		log.Printf("[%s] WARNING: %s offered no STARTTLS; sending credentials unencrypted", mc.id, mc.serverName())
 	}
 
 	// Perform authentication
@@ -993,29 +1073,124 @@ func (mc *MailConnection) authenticateSMTP(authType, username, password string, 
 	return nil
 }
 
-// readIMAPResponse reads a complete IMAP response for a given tag
-func (mc *MailConnection) readIMAPResponse(tag string) (string, error) {
-	var response strings.Builder
+// readIMAPResponse reads a complete IMAP response for a given tag. ok reports
+// whether the command succeeded, and is decided by the tagged line alone — the
+// only line that carries the result. Searching the whole response for
+// "<tag> OK" would let a server report failure in the tagged line while smuggling
+// the same text through an untagged data line, and be believed.
+func (mc *MailConnection) readIMAPResponse(tag string) (response string, ok bool, err error) {
+	var b strings.Builder
 
 	for {
 		line, err := mc.serverReader.ReadString('\n')
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 
 		if mc.debug {
 			log.Printf("[%s] Server: %s", mc.id, strings.TrimSpace(line))
 		}
 
-		response.WriteString(line)
+		if b.Len()+len(line) > maxIMAPResponseBytes {
+			return "", false, fmt.Errorf("response exceeded %d bytes with no tagged line", maxIMAPResponseBytes)
+		}
+		b.WriteString(line)
 
 		// Check if this is the tagged response
 		if strings.HasPrefix(line, tag+" ") {
-			break
+			status := strings.ToUpper(strings.TrimSpace(line[len(tag)+1:]))
+			return b.String(), status == "OK" || strings.HasPrefix(status, "OK "), nil
 		}
 	}
+}
 
-	return response.String(), nil
+// parseIMAPArgs splits an IMAP command line into its arguments, honouring
+// double-quoted strings and backslash escapes within them. Splitting on
+// whitespace alone corrupts any argument containing a space.
+func parseIMAPArgs(line string) []string {
+	var (
+		args    []string
+		cur     strings.Builder
+		inQuote bool
+		escaped bool
+		quoted  bool
+	)
+	for _, r := range line {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case inQuote && r == '\\':
+			escaped = true
+		case r == '"':
+			inQuote = !inQuote
+			quoted = true
+		case !inQuote && (r == ' ' || r == '\t' || r == '\r' || r == '\n'):
+			if quoted || cur.Len() > 0 {
+				args = append(args, cur.String())
+				cur.Reset()
+				quoted = false
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if quoted || cur.Len() > 0 {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+// imapQuote renders s as an IMAP quoted string. Backslashes and quotes are
+// escaped so a crafted value cannot close the string and start a new command.
+func imapQuote(s string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+}
+
+// validIMAPTag reports whether tag is a plain IMAP atom, safe to echo into a
+// command line sent upstream.
+func validIMAPTag(tag string) bool {
+	if tag == "" || len(tag) > 32 {
+		return false
+	}
+	for _, r := range tag {
+		if r <= ' ' || r > '~' {
+			return false
+		}
+		if strings.ContainsRune(`"\(){%*]`, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isSMTPCapability reports whether an EHLO response line advertises the named
+// capability. Response lines look like "250-STARTTLS" or "250 STARTTLS".
+func isSMTPCapability(line, capability string) bool {
+	line = strings.TrimSpace(line)
+	if len(line) < 4 {
+		return false
+	}
+	fields := strings.Fields(line[4:])
+	return len(fields) > 0 && strings.EqualFold(fields[0], capability)
+}
+
+// recoverConn turns a panic while serving one connection into a logged error.
+// Every connection runs on its own goroutine, where an unrecovered panic would
+// otherwise terminate the whole process — including the HTTP proxy and every
+// other session in flight. Use it as `defer recoverConn(id)`: recover() only
+// takes effect when the function calling it is the one that was deferred.
+func recoverConn(id string) {
+	logPanic(id, recover())
+}
+
+// logPanic reports a recovered panic value. It is separate from recoverConn so
+// that deferred closures which need to do more than recover — signal a channel,
+// close a connection — can call recover() themselves and hand the value here.
+func logPanic(id string, r interface{}) {
+	if r != nil {
+		log.Printf("[%s] recovered from panic: %v\n%s", id, r, rdebug.Stack())
+	}
 }
 
 // transparentProxy switches to transparent proxy mode after authentication
@@ -1047,16 +1222,23 @@ func (mc *MailConnection) transparentProxy() {
 	// For IMAP, use simple transparent proxy
 	done := make(chan bool, 2)
 
-	// Client to server
+	// Client to server. The done signal is sent from a defer so a panic cannot
+	// leave the waiter below blocked forever.
 	go func() {
+		defer func() {
+			logPanic(mc.id, recover())
+			done <- true
+		}()
 		io.Copy(mc.serverConn, mc.clientConn)
-		done <- true
 	}()
 
 	// Server to client
 	go func() {
+		defer func() {
+			logPanic(mc.id, recover())
+			done <- true
+		}()
 		io.Copy(mc.clientConn, mc.serverConn)
-		done <- true
 	}()
 
 	// Wait for either direction to complete
@@ -1074,6 +1256,12 @@ func (mc *MailConnection) transparentSMTPProxy() {
 
 	// Server to client - log responses if debug enabled
 	go func() {
+		// Close from a defer too, so a panic still tears the session down rather
+		// than stranding the client half.
+		defer func() {
+			logPanic(mc.id, recover())
+			mc.Close()
+		}()
 		if mc.debug {
 			log.Printf("[%s] Starting server-to-client relay goroutine", mc.id)
 		}
