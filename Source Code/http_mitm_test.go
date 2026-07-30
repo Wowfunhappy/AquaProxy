@@ -722,6 +722,54 @@ func TestDialUpstreamChasesAIA(t *testing.T) {
 	}
 }
 
+// TestDialUpstreamRejectsUntrustedCertOnEveryDial proves an untrusted
+// certificate is rejected on every dial, not just the first. dialUpstream's
+// logging-only retry handshakes with verification disabled; if that handshake's
+// session ticket lands in the shared ClientSessionCache, the next dial resumes
+// the session — and resumption never runs VerifyPeerCertificate, silently
+// turning "reject" into "accept" for as long as the ticket lives.
+func TestDialUpstreamRejectsUntrustedCertOnEveryDial(t *testing.T) {
+	// Self-signed server certificate, deliberately absent from the proxy's roots.
+	leafCert, leafKey := makeCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "untrusted.test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"untrusted.test"},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, nil, nil)
+
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{leafCert.Raw}, PrivateKey: leafKey}},
+		// Under TLS 1.2 the session ticket is delivered during the handshake
+		// itself, so the logging retry caches it without ever reading from the
+		// connection — the exact conditions of the reported bug.
+		MaxVersion: tls.VersionTLS12,
+	}
+	ts.StartTLS()
+	defer ts.Close()
+	u, _ := url.Parse(ts.URL)
+	addr := u.Host
+
+	// Mirror HTTPMain's client config: shared session cache, roots that do not
+	// include the server's certificate.
+	p := &Proxy{TLSClientConfig: &tls.Config{
+		RootCAs:            x509.NewCertPool(),
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
+	}}
+
+	resetAIACache()
+	for i := 1; i <= 3; i++ {
+		conn, err := p.dialUpstream(addr, true, "untrusted.test", "test")
+		if err == nil {
+			conn.Close()
+			t.Fatalf("dial %d: dialUpstream accepted an untrusted certificate (unverified session resumed from cache?)", i)
+		}
+	}
+}
+
 // makePKCS7CertsOnly builds a minimal PKCS#7 "certs-only" SignedData bundle
 // wrapping the given certificates — the format CAs serve at .p7c AIA URLs.
 func makePKCS7CertsOnly(t *testing.T, certs ...*x509.Certificate) []byte {

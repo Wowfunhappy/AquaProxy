@@ -1384,6 +1384,11 @@ func (p *Proxy) dialUpstream(addr string, isTLS bool, serverName, connID string)
 		*retryConfig = *cConfig
 		retryConfig.InsecureSkipVerify = true
 		retryConfig.VerifyPeerCertificate = nil // truly skip verification to capture the chain
+		// The unverified handshake must not share the real session cache: a session
+		// ticket cached here would let later dials resume the session, and
+		// resumption skips VerifyPeerCertificate entirely — so a host just rejected
+		// for a bad certificate would be accepted unverified until the ticket expired.
+		retryConfig.ClientSessionCache = nil
 		if retryConn, retryErr := tls.Dial("tcp", addr, retryConfig); retryErr == nil {
 			capturedChain := retryConn.ConnectionState().PeerCertificates
 			retryConn.Close()
