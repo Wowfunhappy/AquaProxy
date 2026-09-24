@@ -27,13 +27,13 @@ sudo pkgutil --forget com.wowfunhappy.https-proxy.dictionary-fixer >/dev/null 2>
 
 
 # Unload LaunchAgents
-launchctl unload /Library/LaunchAgents/Wowfunhappy.AquaProxy.HTTP.plist >/dev/null 2>&1
-launchctl unload /Library/LaunchAgents/Wowfunhappy.AquaProxy.IMAP.plist >/dev/null 2>&1
+launchctl unload /Library/LaunchAgents/Wowfunhappy.AquaProxy.Restarter.plist >/dev/null 2>&1
+launchctl unload /Library/LaunchAgents/Wowfunhappy.AquaProxy.Proxy.plist >/dev/null 2>&1
 launchctl unload /Library/LaunchAgents/Wowfunhappy.AquaProxy.SyncProxiesWithShell.plist >/dev/null 2>&1
 
 # Remove LaunchAgents
-sudo rm -f /Library/LaunchAgents/Wowfunhappy.AquaProxy.HTTP.plist
-sudo rm -f /Library/LaunchAgents/Wowfunhappy.AquaProxy.IMAP.plist
+sudo rm -f /Library/LaunchAgents/Wowfunhappy.AquaProxy.Restarter.plist
+sudo rm -f /Library/LaunchAgents/Wowfunhappy.AquaProxy.Proxy.plist
 sudo rm -f /Library/LaunchAgents/Wowfunhappy.AquaProxy.SyncProxiesWithShell.plist
 
 # Remove AquaProxy directory
